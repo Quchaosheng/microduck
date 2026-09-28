@@ -539,40 +539,46 @@ the 1920×1080 crop, and every intrinsic would be off by about 1.7×. `mediad::c
 arithmetic and the mode table, including the fact that reading 720p off the sensor would *narrow*
 the view to 27° rather than saving anything.
 
-## 11. Everything on the wire should carry the time it happened — **the control half built, the media half checked**
+## 11. Everything on the wire should carry the time it happened — **built**
 
-Half of what this section wanted is built, and the other half has been checked rather than left
-wanted. This is both, and what is left.
+Both halves are built. A sample and a frame each state when the robot saw them, on one clock, and
+the check this section asked for is `scripts/check-frame-dating.py`.
 
-**The control channel — built (v24).** `robot.state` and `tof.frame` carry `t_ns`, and so does
+**The control channel (v24).** `robot.state` and `tof.frame` carry `t_ns`, and so does
 `head_imu.frame`: `CLOCK_MONOTONIC` in nanoseconds, one clock every daemon on a board shares, so a
 sample from `robotd` and a frame from `tofd` go on one axis without an argument about two start
-times. The **boot epoch** this section asked for is the second half of the pair `media.video`
-publishes — `mono_ns` and `real_ns` — because the two clocks come off one hardware source, which
-makes the mapping from any `t_ns` to wall clock an addition rather than an estimate.
-`proto::clock::ClockPair` is the consumer's side of that pair, and it is where the bound this
-section asked to have "written down somewhere" lives. It is not what §11 assumed when it wrote
-"wanted": the two clocks are one count with an additive constant between them, and the constant
-is `offs_real`, which only `tk_set_wall_to_mono` writes — `ntp.c` never calls it, and what NTP's
-frequency discipline turns is `tk->tkr_mono.mult`, which moves both clocks together. So there is
-no drift term to bound, and the conversion's own error is the pair's read separation — tens of
-nanoseconds at the median, and not a bound of its own. `MAXFREQ` at 500 ppm
-(`include/linux/timex.h`) is the ceiling on how far the kernel will pull the *shared rate* — a
-rate limit, so the number to quote for an interval measured on this clock rather than for this
-conversion. What does move the offset is a **step**, and a leap second.
-The board has no battery-backed RTC and boots at 1970, so a pair taken before NTP first sets the
-clock is wrong by decades while looking like an ordinary number. Whether the clock has been set is
-`updater`'s judgement rather than this bridge's — `updater/src/preflight.rs` owns that floor and
-reaches it the same way — and a consumer that needs the answer should ask there rather than test
-this pair's contents. `robotd-design.md` §Mapping telemetry owns the fields.
+times. `robotd-design.md` §Mapping telemetry owns the fields.
 
-**The media half — the check came back "not cheap".** The mechanism named here was the
-`abs-capture-time` RTP header extension, and the first job this section set was finding out whether
-anything on the receiving side surfaces it. Nothing does:
+**The media half.** A frame is dated twice, and the two are for different jobs.
 
-- `webrtcsink` configures TWCC and nothing else on 0.15.3 — the version `media-bringup.md` builds —
-  and adds the color-space extension on the newer main. Neither series puts a capture time on the
-  wire.
+*RTCP sender reports* carry the NTP time of the moment they were written beside the RTP timestamp
+of that moment, and `configure_sender_reports` puts them on the robot's own clock:
+`ntp-time-source=clock-time` states that field in pipeline-clock time, and `rtcp-sync-send-time=false`
+makes it the *capture* time rather than the send time. The pipeline runs on `GstSystemClock`, which
+is `CLOCK_MONOTONIC` — the clock `t_ns` is read from — so a peer that reads `sr-ntptime` against
+`sr-rtptime` gets an answer already on the axis the samples are on. This is what the default could
+not do: `ntp` is `CLOCK_REALTIME` converted to the NTP epoch, which needs a clock that has been set,
+and this board has no battery-backed RTC and boots at 1970.
+
+*The RFC 6051 `ntp-64` header extension* is the second, and `wire_payloader_setup` adds it to every
+consumer's payloader. It exists because a report arrives once a second at best: a receiver with only
+reports interpolates between them and cannot date the frames before the first one, while the
+extension is written into the packets themselves, so every frame carries its own capture time from
+the first packet on. `rtpsession` fills it in on the way out, from the same buffer timestamp
+`rtcp-sync-send-time=false` puts on the report, so the two agree by construction rather than by two
+pieces of code being kept in step.
+
+**Capture time, not send time, because the driver stamps the buffer.** `rkisp` stamps with
+`ktime_get_ns()` at the ISP's frame start and `v4l2src` maps that into the PTS, so what travels is
+when the sensor saw the scene. The error this leaves is the frame-start-versus-exposure-start
+difference inside the sensor, and not the encoder, the queue or the network — which is the
+difference between a consumer that can fuse a camera with a ToF and one that can only display it.
+
+**The `abs-capture-time` extension is a dead end, and that is worth keeping written down.** This
+section named it as the mechanism and set finding a receiver as the first job. Nothing fills it:
+
+- `webrtcsink` configures TWCC, and the color-space extension on newer releases. Neither puts a
+  capture time on the wire.
 - `aiortc` does not read one: its extension map carries the stream id, `abs-send-time`, the offset,
   the audio level and the sequence number.
 - No browser API carries a capture time. `webrtc-pc`'s `RTCRtpSynchronizationSource` is an empty
@@ -581,46 +587,42 @@ anything on the receiving side surfaces it. Nothing does:
   `RTCRtpContributingSource` — is not implemented anywhere this was checked: Chromium 131 exposes
   neither on `getSynchronizationSources()`, and its offer carries no `abs-capture-time` extmap.
 
-So the extension buys nothing, and the answer is the one the control half already implies: **RTCP
-sender reports**, whose NTP time is the realtime clock by default (`rtpmanager`'s `ntp-time-source`
-is `ntp`), put on the monotonic axis by `media.video`'s pair. That is why v24 published
-`mono_ns`/`real_ns` rather than waiting for an extension.
+`ntp-64` is what replaced it, and the two are not alternatives: `ntp-64` is an RTP header extension
+with a receiver already in `rtpjitterbuffer`, where `abs-capture-time` had none.
 
-**Only one kind of receiver can actually use it, and the difference is the RTP half of the pair.**
-Dating a frame needs the sender report's *two* numbers — its NTP time and the RTP time it was taken
-at:
+**What each kind of receiver gets.**
 
-| Receiver | the SR's NTP time | the SR's RTP time |
+| Receiver | capture time | how |
 |---|---|---|
-| GStreamer (`rtpbin` → `rtpsession`'s `stats`) | `sr-ntptime` | **`sr-rtptime`**, beside it in the same structure |
-| `aiortc` | `remoteTimestamp`, on `remote-outbound-rtp` | discarded — its SR handler reads `sender_info.ntp_timestamp` and never `rtp_timestamp` |
-| a browser | `remoteTimestamp`, on `remote-outbound-rtp` | none |
+| GStreamer (`rtpbin`) | per frame, `GstReferenceTimestampMeta` on the buffer | `add-reference-timestamp-meta=true` on `rtpbin`; the id comes from the SDP's `extmap` |
+| a browser | the sender report's NTP time, and `rtpTimestamp` per frame | `getSynchronizationSources()`; `estimatedPlayoutTimestamp` reads directly in robot `t_ns` |
+| `aiortc` | nothing usable | it rebases RTP timestamps to the first packet, so a frame's RTP time no longer relates to the report |
 
-The browser row needs one correction. §11 wrote that a browser has "not in any API" an RTP half,
-and that is false: `getSynchronizationSources()` returns an `rtpTimestamp`, required by
-`webrtc-pc`'s `RTCRtpContributingSource` and populated by Chromium (measured on a live receiver:
-`["rtpTimestamp","source","timestamp"]`). What keeps the row "none" is *which* RTP time it is — the
-frame being played out, at the local `timestamp` beside it, rather than the moment an SR was taken
-at; the same counter read at a different point, and no pair for `remoteTimestamp`. The NTP half is
-conditional too: Chromium builds `remote-outbound-rtp` only once a sender report has arrived
-(`last_sender_report_timestamp` is set), so a sender that never reports leaves the browser with
-neither half.
+An `aiortc` peer would need a patch; a browser has both numbers and has to pair them itself. The
+GStreamer row is the one that needs no work from the receiver beyond a property, which is why
+`scripts/check-frame-dating.py` is written as a `webrtcsrc` pipeline.
 
-So a GStreamer receiver can map a decoded frame's RTP timestamp onto the wall clock and date it; an
-`aiortc` peer and a browser page can say what the sender's clock read and cannot say which frame
-that was. That is a limit of those two receivers rather than of the wire — the robot is already
-sending the report — and it is why the console's clock row dates a *sample* and not a picture.
+**FEC is the one thing that breaks it, and it is two GStreamer bugs rather than a design fault.**
+`webrtcsink` sends FEC to a consumer that asks for it, and `webrtcsrc` asks:
+`fec-type=ULP_RED` on every transceiver it creates. With ULPFEC in the stream, H.264 and ULPFEC
+packets alternate on one SSRC, and `rtpjitterbuffer` drops its RTP-to-NTP mapping on every payload
+type change — `gstrtpjitterbuffer.c` clears `last_known_ext_rtptime`/`last_known_ntpnstime` in the
+`priv->last_pt != pt` branch. The extension handling was fixed on `main` (`rtpredenc`/`rtpreddec`,
+MR !12185, so 1.30); the jitterbuffer half was still there in 1.28.6 and the board runs 1.26.2.
 
-**What is left.** A consumer that does it, in the one place it can be done: a GStreamer receiver
-that reads `sr-rtptime`/`sr-ntptime` against a frame's RTP timestamp and reports which of that frame
-and a `robot.state` sample came first. The console's clock row reads the control half of the bridge
-today, so a sample's wall-clock moment and its age are on screen, bounded by the two machines'
-clock agreement and not claimed to be exact. The error a frame carries is the sender-report interval
-plus the encoder's latency, both of which such a receiver can state rather than inherit from the
-network. `remote-access-design.md` §9 carries it.
+Reported from a loopback `webrtcsink`/`webrtcsrc` pair, sent with FEC on both times and answered
+once each way: **2 frames of 302** carried a timestamp with FEC on, and **300 of 303, from the
+first frame,** with it off. A consumer
+therefore answers without FEC, which is negotiation and not a sender-side change, and the robot
+needs no change for it: FEC is negotiated per consumer, so a browser keeps it.
 
-All of it is additive, so no `API_VERSION` bump was needed for the fields v24 added — an older
-client ignores what it does not know.
+**What is left.** Nothing in this repository. A consumer that wants the comparison
+`issue #220` asks for is `scripts/check-frame-dating.py`, which prints each frame's capture time
+beside the latest `robot.state` `t_ns`. `remote-access-design.md` §9 carries it.
+
+All of it is additive, so no `API_VERSION` bump was needed — the fields v24 added are ignored by an
+older client, and the media half changed nothing on the wire but which clock the existing fields
+state.
 
 ## 12. Deferred, with reasons
 
