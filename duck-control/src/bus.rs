@@ -27,7 +27,7 @@ use crate::imu::{IMU_BLOCK_LEN, SflpDecoder};
 use crate::io::{ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
 use crate::model::{
     BAUD_RATE, EXPECTED_REGISTERS, FACTORY_BAUD_RATE, FACTORY_ID, IMU_DXL_ID, JOINT_IDS,
-    JOINT_NAMES, NUM_JOINTS,
+    JOINT_NAMES, NUM_JOINTS, homing_offset,
 };
 
 /// Start of the contiguous block read every tick: `present_pwm`, `present_current`,
@@ -49,6 +49,13 @@ const RAD_PER_SEC_PER_COUNT: f64 = 0.229 * (2.0 * PI / 60.0);
 /// bus time than the two transactions do.
 const SLOW_READ_ADDR: u8 = 144;
 const SLOW_READ_LEN: u8 = 3;
+
+/// `hardware_error_status`, one byte — see [`RobotIo::hardware_errors`].
+const HARDWARE_ERROR_ADDR: u8 = 70;
+
+/// `model_number` (0, `u16`) through `firmware_version` (6, `u8`): seven bytes, once a start.
+const IDENTITY_ADDR: u8 = 0;
+const IDENTITY_LEN: u8 = 7;
 
 /// `present_input_voltage` counts 0.1 V each.
 const VOLTS_PER_COUNT: f64 = 0.1;
@@ -143,6 +150,13 @@ impl DynamixelIo {
         })
     }
 
+    /// The body IMU's sensor→trunk mount, which is the robot's ([`SflpDecoder::DEFAULT_MOUNT`]
+    /// for a `zero3`, [`SflpDecoder::BETA_MOUNT`] for a `beta`). Starts the decoder afresh, so
+    /// call it right after [`Self::open`], before the first read.
+    pub fn set_imu_mount(&mut self, mount: [f64; 4]) {
+        self.imu = SflpDecoder::new(mount);
+    }
+
     /// Assert — and correct — the EEPROM registers the control loop depends on.
     ///
     /// Returns how many needed fixing. A servo that has been factory-reset or swapped in
@@ -193,6 +207,34 @@ impl DynamixelIo {
             std::thread::sleep(EEPROM_SETTLE);
             fixed += 1;
         }
+
+        // An EEPROM register like the others, so it is written only with torque off, which is how
+        // a servo powers up and how a fresh one is adopted.
+        let want = homing_offset(id);
+        let got = *self
+            .controller
+            .read_homing_offset(id)
+            .map_err(|e| IoError::Bus(format!("read homing_offset on {id}: {e}")))?
+            .first()
+            .ok_or(IoError::ShortRead {
+                what: "register read",
+                expected: 1,
+                got: 0,
+            })?;
+        if got != want {
+            tracing::warn!(
+                id,
+                register = "homing_offset",
+                got,
+                want,
+                "correcting motor register"
+            );
+            self.controller
+                .write_homing_offset(id, want)
+                .map_err(|e| IoError::Bus(format!("write homing_offset on {id}: {e}")))?;
+            std::thread::sleep(EEPROM_SETTLE);
+            fixed += 1;
+        }
         Ok(fixed)
     }
 
@@ -214,6 +256,17 @@ impl DynamixelIo {
             }
         }
         Ok(missing)
+    }
+
+    /// Does the IMU board answer a ping?
+    ///
+    /// Asked apart from [`Self::missing_servos`] because the census covers servos only, and a
+    /// silent IMU board otherwise surfaces as the first [`RobotIo::read`] failing — which, from
+    /// outside, looks exactly like no robot at all.
+    pub fn imu_answers(&mut self) -> Result<bool> {
+        self.controller
+            .ping(IMU_DXL_ID)
+            .map_err(|e| IoError::Bus(format!("ping imu {IMU_DXL_ID}: {e}")))
     }
 
     /// Flash a factory-fresh servo so it takes the place of the one that is missing.
@@ -621,6 +674,49 @@ impl RobotIo for DynamixelIo {
 
     fn imu_stale(&self) -> ImuStale {
         self.stale_imu.stale
+    }
+
+    fn hardware_errors(&mut self) -> Result<Option<[u8; NUM_JOINTS]>> {
+        let blocks = self
+            .controller
+            .sync_read_raw_data(&JOINT_IDS, HARDWARE_ERROR_ADDR, 1)
+            .map_err(|e| IoError::Bus(format!("hardware_error_status sync_read: {e}")))?;
+        if blocks.len() != NUM_JOINTS {
+            return Err(IoError::ShortRead {
+                what: "hardware error blocks",
+                expected: NUM_JOINTS,
+                got: blocks.len(),
+            });
+        }
+        let mut errors = [0u8; NUM_JOINTS];
+        for (slot, block) in errors.iter_mut().zip(&blocks) {
+            *slot = block.first().copied().unwrap_or(0);
+        }
+        Ok(Some(errors))
+    }
+
+    fn servo_identity(&mut self) -> Result<Option<[crate::io::ServoIdentity; NUM_JOINTS]>> {
+        let blocks = self
+            .controller
+            .sync_read_raw_data(&JOINT_IDS, IDENTITY_ADDR, IDENTITY_LEN)
+            .map_err(|e| IoError::Bus(format!("model/firmware sync_read: {e}")))?;
+        if blocks.len() != NUM_JOINTS {
+            return Err(IoError::ShortRead {
+                what: "identity blocks",
+                expected: NUM_JOINTS,
+                got: blocks.len(),
+            });
+        }
+        let mut ids = [crate::io::ServoIdentity::default(); NUM_JOINTS];
+        for (slot, block) in ids.iter_mut().zip(&blocks) {
+            if block.len() == IDENTITY_LEN as usize {
+                *slot = crate::io::ServoIdentity {
+                    model: u16::from_le_bytes([block[0], block[1]]),
+                    firmware: block[6],
+                };
+            }
+        }
+        Ok(Some(ids))
     }
 
     fn imu_ready(&self) -> bool {

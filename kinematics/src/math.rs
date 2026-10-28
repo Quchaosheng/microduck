@@ -39,6 +39,8 @@ impl Quat {
     /// the identity rather than NaN — it can only come from a hand-written XML
     /// attribute, and a model that ignores a broken quat is diagnosable where a
     /// model full of NaN is not.
+    #[must_use]
+    #[allow(clippy::suboptimal_flops)]
     pub fn normalized(self) -> Self {
         let n = (self.w * self.w + self.x * self.x + self.y * self.y + self.z * self.z).sqrt();
         if n < 1e-12 {
@@ -57,13 +59,16 @@ impl Quat {
     /// full quaternion sandwich.
     pub fn rotate(self, v: [f64; 3]) -> [f64; 3] {
         let [vx, vy, vz] = v;
-        let tx = 2.0 * (self.y * vz - self.z * vy);
-        let ty = 2.0 * (self.z * vx - self.x * vz);
-        let tz = 2.0 * (self.x * vy - self.y * vx);
+        let tx = 2.0 * self.z.mul_add(-vy, self.y * vz);
+        let ty = 2.0 * self.x.mul_add(-vz, self.z * vx);
+        let tz = 2.0 * self.y.mul_add(-vx, self.x * vy);
         [
-            vx + self.w * tx + self.y * tz - self.z * ty,
-            vy + self.w * ty + self.z * tx - self.x * tz,
-            vz + self.w * tz + self.x * ty - self.y * tx,
+            self.z
+                .mul_add(-ty, self.y.mul_add(tz, self.w.mul_add(tx, vx))),
+            self.x
+                .mul_add(-tz, self.z.mul_add(tx, self.w.mul_add(ty, vy))),
+            self.y
+                .mul_add(-tx, self.x.mul_add(ty, self.w.mul_add(tz, vz))),
         ]
     }
 
@@ -78,6 +83,7 @@ impl Quat {
     }
 
     /// Yaw about world +z, for an estimator that reports heading as one angle.
+    #[allow(clippy::suboptimal_flops)]
     pub fn yaw(self) -> f64 {
         // atan2 of the rotation matrix's (1,0) over (0,0) elements, expanded.
         let siny = 2.0 * (self.w * self.z + self.x * self.y);
@@ -89,6 +95,7 @@ impl Quat {
 impl Mul for Quat {
     type Output = Quat;
 
+    #[allow(clippy::suboptimal_flops)]
     fn mul(self, b: Quat) -> Quat {
         let a = self;
         Quat::new(

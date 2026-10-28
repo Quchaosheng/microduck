@@ -395,7 +395,7 @@ The API version bumps when the interface changes — e.g. a model starts consumi
 An unreachable `robotd` makes this *unknown* rather than incompatible, which is a
 reason to wait for a model but not for the daemon — see §5.4's `Compatibility` note.
 
-### 5.6 Hardware: single target
+### 5.6 Hardware: one build, declared boards
 
 **Current target: Radxa Zero 3** (RK3566, Cortex-A55 → `aarch64`) running **Armbian
 26.2.x** with the **Debian 13 (Trixie)** userland, Rockchip BSP kernel 6.1.115.
@@ -425,22 +425,39 @@ What the container cannot cover, and hardware must: a real `systemctl restart`
 against the real filesystem, and whether the health-gate timeouts suit a robot that
 takes tens of seconds to stand up.
 
-**v1 targets one well-specified hardware configuration.** No board / variant /
-IMU / camera matrix, no per-device hardware profile, no artifact selection logic.
-The prototype's hardware variance is an artifact of exploration, not a
-requirement to carry forward.
+**Two boards, one build.** The Zero 3W and the beta are both RK3566, so one aarch64 release
+runs on either. No variant / IMU / camera matrix, no per-device hardware profile, no artifact
+selection logic: what differs between the boards is the daemon's business, keyed on the board
+the robot declares, not the updater's.
 
-What we keep is deliberately minimal:
-- `min_hw_rev` in the manifest (§5.3) as a single forward-compatibility guard, so
-  a future board revision can refuse an incompatible artifact. One integer, no
-  matrix.
+What the updater keeps is deliberately minimal:
+- **`min_hw_rev`** in the manifest (§5.3): one integer, refused when it is above the robot's.
+- **The robot's revision is its declared board**: `[board] version` in `robotd.toml`
+  (`robotd_params::board::Board::hw_rev`: zero3 is 1, beta is 2), read before every check.
+  `hw_rev` in `updater.toml` applies only when no board is declared — every robot installed
+  before the board was a setting carries `hw_rev = 1`, and a board provisioned against a
+  release that still shipped it does too, so it cannot be allowed to outrank the board.
 - A **stable device ID** for the update log (§8.3) and any future phone-home. The
-  SoC serial (`/proc/device-tree/serial-number`) works and survives reflashes —
-  no provisioning step needed to obtain it.
+  SoC serial works and survives reflashes — no provisioning step needed to obtain
+  it. Where it is read differs per board ([`app-path-design.md`](app-path-design.md) §8.2).
 
-If a second hardware target ever appears, the manifest gains constraints and the
-engine gains a match step. Not before — this is exactly the speculative
-complexity to avoid.
+#### Retiring a board
+
+A board is retired by giving it a last release, in `Board::last_release`. That one change
+does both halves:
+
+- **The warning.** From the release that sets it, `robotctl health` on that board says updates
+  end at that version. Set it a few releases ahead, so the warning is on robots for a while.
+- **The cut-off.** `xtask package` derives `min_hw_rev` from the table
+  (`board::min_hw_rev`): the lowest revision among the boards the release being packaged still
+  supports. The first release after a board's last is packaged above that board's revision, and
+  the updater already on the board refuses it — `requires hardware revision 2 or newer`. That
+  check has been in every updater since the first, so retiring a board needs nothing from the
+  robots being retired.
+
+`min_hw_rev` is one number, so boards retire oldest first; a test holds the table to that.
+A prerelease sorts below its release, so a dev build of a board's last release still installs
+on it.
 
 ### 5.7 Robot-specific state must survive updates
 
@@ -475,6 +492,18 @@ done only when genuinely needed, never unconditionally on every update.
   - **GitHub API** query for the newest tag matching a channel prefix
     (`daemon-v*`) — works with a single shared repo. Preferred if we keep both
     channels in one repo.
+
+  **Decided: the API, by tags.** `updaterd` reads `git/matching-refs/tags/<prefix>` — the
+  channel's tags only, filtered by GitHub — and takes the highest semver whose release exists,
+  is not a draft, and is not flagged prerelease (staging allows the flag). A tag with no release,
+  which is every release while it builds, falls through to the one below; five in a row is
+  reported. It does **not** list releases: that listing carries every dev build with all of its
+  assets, ~35 KB each, so its size follows the repository's activity rather than the channel's.
+  At 67 releases its first page passed the 1 MiB metadata cap and every robot stopped updating
+  (#421). Robots on 0.17.4 and older still read it, 100 per page, and 0.17.5 reads it 20 per
+  page; either breaks again when a page outgrows the cap, and only deleting releases unblocks
+  them. A dev ref never used either list: `--ref <branch>` asks
+  for `releases/tags/daemon-dev-<branch>` directly.
 - CI side: `cargo-dist` can build and publish signed artifacts to GitHub
   Releases; we host manifests as additional assets.
 
@@ -900,6 +929,41 @@ cost — a re-signing schedule that, if missed, warns the entire fleet — is no
 paying before the publishing pipeline is routine. (2) is cheap but solves a problem
 §8.4.1 already covers at the version level.
 
+**(3) is built.** `update.status` carries `last_checked` per component, and `robotctl health`
+says when the update source last answered and warns once it has been quiet for a week. Only the
+source's latest counts, signed and for the right channel, so a failed fetch, a manifest that does
+not verify and a `--from` directory all leave it where it was. As the option says, it makes a robot
+that cannot reach its source visible, and not one being fed an old signed manifest; that is still
+(1).
+
+**A source that has never answered is the warning, not the silence.** A board that has been
+blocked since it was provisioned has nothing recorded — which is also what an `updaterd` older
+than `API_LAST_CHECKED` sends. `robotctl health` tells the two apart by the API version in the
+`hello` it already has, and warns on the first: a robot that has never reached its source is the
+worst case this report exists for, and reading it as "no news" prints what a healthy robot prints.
+
+**Each check is recorded too, answered or not, with why it failed.** Nothing recorded was still two
+states: checks that fail, and an `updaterd` that has not run its first one — every board for the
+minute after it starts, including right after the update that brought the record in, which warned
+that the source had never answered. `check-attempts.json` holds the last check per component and
+`update.status` carries it as `last_check_attempt` (`API_CHECK_ATTEMPT`). No attempt yet is a line,
+not a warning; attempts that failed are the warning, and it gives the error rather than pointing at
+the journal. An attempt is recorded under any clock, unlike the answer: a board whose clock has not
+synced is the one failing TLS, and dropping its attempts would read as one that has not checked.
+
+`robotctl update check` runs a check at once, and `robotctl health --check` runs one per component
+before reporting. It is a flag, not the default, because the login banner runs `health` and would
+otherwise wait on the network at every ssh.
+
+**It does depend on the clock**, unlike the option as listed above — a recorded time is only
+meaningful against the one reading it. Both directions are handled where they land rather than
+trusted: a time below §7.2's clock floor is not recorded at all (a board with no RTC, on a
+`local_dir` source that needs no TLS to answer, would otherwise report fifty years of silence the
+moment NTP arrives), and a time *ahead* of the reader's clock is reported as unknown and warned
+about rather than clamped to "just now" — a board whose clock was corrected backwards after a
+check would otherwise read as freshly checked for good, since only a successful check replaces the
+record.
+
 **Explicitly accepted for v1:** a robot whose network is hostile can be prevented
 from updating. It cannot be made to *downgrade*, install an artifact we did not
 sign, or install one that fails its health gate. Those are the properties we
@@ -1044,7 +1108,6 @@ parses it, so it cannot drift from the code. Abridged here:
 ```toml
 # /etc/robot/updater.toml
 trusted_keys_dir = "/etc/robot/trusted_keys"   # a *set* of keys (§5.4)
-hw_rev           = 1
 state_dir        = "/var/lib/robot/updater"    # must be outside every install_dir
 
 [component.daemon]
@@ -1087,6 +1150,37 @@ loudly rather than silently disabling the setting it was meant to change. Notabl
 refused: `state_dir` inside an `install_dir` (a swap would destroy the update log),
 two components sharing an `install_dir`, relative paths, and `keep_previous = 0`
 with no golden (no rollback target).
+
+Two optional per-component guards reject a signed but unsuitable artifact:
+
+```toml
+[component.daemon]
+# Alongside source, install_dir and on_apply:
+required_files = ["bin/robotd", "bin/mediad"]
+max_artifact_bytes = 134217728 # compressed bytes, inclusive
+```
+
+`max_artifact_bytes` requires a declared `size` in the signed manifest. Both `check`
+and `apply` refuse a missing or over-budget size before fetching a new artifact;
+an already-installed version needs no download and bypasses this budget.
+`apply` also checks the downloaded file's actual size before extraction. This is
+an installation budget, not a per-transfer streaming limit: an underreported
+artifact is refused after download. The HTTP source's transfer limit and the
+global `max_uncompressed_bytes` / `max_archive_entries` extraction limits still apply.
+
+`required_files` is checked after verified extraction, before either hook or the
+live swap, including for a dry run. Entries must be nonempty relative file paths
+without `..`; directories and links resolving outside the extracted tree do not
+satisfy them. `check` does not download or inspect the archive, so it cannot verify
+this file list. A refusal leaves the installed release in place and removes staging.
+
+Omitted settings disable their respective guards. The shipped `deploy/updater.toml`
+enables `required_files` for every daemon release binary, including tools that no
+systemd unit executes; `xtask` tests keep that list matched to all packaging recipes.
+`max_artifact_bytes` remains unset. The installer pairs this config with its release
+through `DUCK_CONFIG_REF`, so the updater understands the shipped keys. When overriding
+that ref or adding these keys to an existing config, use an updater that understands
+them; older updaters reject unknown fields.
 
 
 Note the model uses `reload` (SIGHUP → re-mmap weights) rather than `restart`,
@@ -1463,10 +1557,9 @@ Still open:
   That listener's blast radius is bounded by signature verification (an unsigned
   upload cannot install; worst case is filling the disk), but it wants a token
   and a deliberate bind regardless (`architecture.md` §2.2). Backup plan, not v1.
-- **Manifest staleness reporting** (§8.4.2) — surface "last successful check N
-  days ago" in `status` and the app, converting a freeze attack from silent to
-  visible. Cheap; recommended. Signed manifest expiry is the real defence but
-  carries a re-signing schedule, deferred until publishing is routine.
+- ~~**Manifest staleness reporting**~~ (§8.4.2), **built**: `update.status` carries
+  `last_checked`, and `robotctl health` warns when a source has been quiet for a week. Signed
+  manifest expiry is still the real defence, deferred until publishing is routine.
 - **Config ownership** — does config ride with the model bundle, the daemon, or
   become its own tiny channel? (Hooks handle migrations either way, §9.)
 - **Minimal success/failure phone-home** — one ping per update would let us catch

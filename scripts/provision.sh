@@ -67,6 +67,7 @@ ENV_TOKEN="${DUCK_TOKEN:-}"
 ENV_DEV_KEY="${DUCK_DEV_KEY:-}"
 ENV_FORCE="${DUCK_FORCE_REINSTALL:-}"
 ENV_WEIRD_BLE="${DUCK_WEIRD_BLE:-}"
+ENV_BOARD="${DUCK_BOARD:-}"
 ENV_GSTREAMER="${DUCK_GSTREAMER:-}"
 ENV_RKAIQ="${DUCK_RKAIQ:-}"
 
@@ -113,6 +114,10 @@ FORCE_REINSTALL="$ENV_FORCE"
 # `robotctl pad pair` has to pause `btd` on a board that has it. See `configure_bluetooth` in
 # `setup-board.sh` for the split this exists for.
 WEIRD_BLE="$ENV_WEIRD_BLE"
+
+# Which electronic board this is. Passed to `install.sh`, which writes it to robotd.toml's
+# `[board] version`; empty leaves that to the file, which is a zero3.
+BOARD="$ENV_BOARD"
 
 # Install the GStreamer stack for `mediad`? Passed to `setup-gstreamer.sh`.
 #
@@ -163,6 +168,18 @@ LOG="${STATE_DIR}/provision.log"
 UNIT=/etc/systemd/system/robot-provision.service
 UNIT_NAME=robot-provision.service
 
+# How a run started by `provision-board.sh` ended, for it to read once ssh returns:
+# `<run id> rebooting`, `<run id> done`, or `<run id> ended <status>`. ssh cannot say on its own —
+# a run that reboots drops the connection, so its exit status is ignored — and without this the
+# launcher assumed every run rebooted into an unattended phase 2 and went to read its log. A
+# re-run on a board whose phase 1 had already run does phase 2 right here instead, so that log
+# was the *previous* attempt's, and its old failure was shown as today's result (2026-10-17).
+#
+# Keyed by the launcher's run id, so an outcome left by an earlier run never answers for this one.
+OUTCOME="${STATE_DIR}/provision.outcome"
+RUN_ID="${DUCK_RUN_ID:-}"
+OUTCOME_SAID=""
+
 # Set when systemd resumed us rather than a human. Changes two things: output goes to $LOG, and
 # a failed wifi cutover is reported rather than retried. See the header.
 RESUMED=0
@@ -178,13 +195,27 @@ DEV_KEY_KEPT="${STATE_DIR}/team.dev.pub"
 SETUP_SELF=/usr/local/sbin/robot-setup-board
 MIGRATE_SELF=/usr/local/sbin/robot-migrate-network
 GST_SELF=/usr/local/sbin/robot-setup-gstreamer
-RKAIQ_SELF=/usr/local/sbin/robot-setup-rkaiq
 
 say()  { printf '\033[1m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ── helpers ──────────────────────────────────────────────────────────────────
+
+# Record how this run ended; see `OUTCOME`. Nothing without a run id: systemd's resume and a
+# human typing the command have no launcher waiting to read it.
+say_outcome() {
+    OUTCOME_SAID=1
+    [ -n "$RUN_ID" ] || return 0
+    mkdir -p "$STATE_DIR"
+    printf '%s %s\n' "$RUN_ID" "$1" > "$OUTCOME" 2>/dev/null || true
+}
+
+# Whatever exit was not a reboot or a finished phase 2 — a `die`, a Ctrl-C, a failed command
+# under `set -e` — is an ending the launcher must hear about rather than wait out.
+on_exit() {
+    [ -n "$OUTCOME_SAID" ] || say_outcome "ended $1"
+}
 
 # Fetch one sibling script into $2. Unlike the `fetch_cmd` in setup-board.sh, which prints a
 # command for a human, this one runs it.
@@ -272,6 +303,7 @@ save_state() {
         kv DUCK_DEV_KEY "$1"
         kv DUCK_FORCE_REINSTALL "$FORCE_REINSTALL"
         kv DUCK_WEIRD_BLE "$WEIRD_BLE"
+        kv DUCK_BOARD "$BOARD"
         kv DUCK_GSTREAMER "$GSTREAMER"
         kv DUCK_ASKED_REF "$ASKED_REF"
         # `PROVISION_*` for the two that are not environment knobs, so sourcing this file cannot
@@ -296,6 +328,7 @@ load_state() {
     DEV_KEY="${ENV_DEV_KEY:-${DUCK_DEV_KEY:-}}"
     FORCE_REINSTALL="${ENV_FORCE:-${DUCK_FORCE_REINSTALL:-}}"
     WEIRD_BLE="${ENV_WEIRD_BLE:-${DUCK_WEIRD_BLE:-}}"
+    BOARD="${ENV_BOARD:-${DUCK_BOARD:-}}"
     GSTREAMER="${ENV_GSTREAMER:-${DUCK_GSTREAMER:-1}}"
     ASKED_REF="${ENV_REF:-${DUCK_ASKED_REF:-}}"
     # No `ENV_` mirror for the name, unlike its neighbours. Theirs exist because sourcing this file
@@ -445,6 +478,19 @@ EOF
         || die "could not enable ${UNIT_NAME}; nothing would finish this after the reboot"
 }
 
+# Phase 2 run from a terminal, on a board whose phase 1 already ran: in practice a re-run after a
+# phase 2 that failed, since the state file is removed only on success. Its output goes to that
+# terminal, so `$LOG` would still hold the previous attempt in full — which anyone reading it, by
+# hand or through an older `provision-board.sh`, takes for this one. Start it over, with a line
+# saying where this attempt's output went.
+restart_log() {
+    : > "$LOG"
+    chmod 640 "$LOG"
+    chgrp robot "$LOG" 2>/dev/null || true
+    printf '%s phase 2 re-run from a terminal; its output went there, not here\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$LOG"
+}
+
 # Disabled *before* phase 2 does anything, so there is at most one automatic attempt ever.
 #
 # The unit file stays on disk as a record of what ran. What must not survive is the enablement:
@@ -481,6 +527,7 @@ reboot_now() {
 EOF
     sleep 10
     say "rebooting"
+    say_outcome rebooting
     systemctl reboot
 }
 
@@ -560,15 +607,16 @@ phase_two() {
     #
     # Two files, not one: the script builds an LD_PRELOAD shim from the C source beside it, and
     # fetching the script alone would leave it with nothing to compile.
+    #
+    # Always fetched, never the persisted copy the others prefer. Until 2026-10-17 that copy could
+    # not find its own shim source and died on every run, and a board keeps whichever copy it has
+    # until a release replaces it — so preferring it would leave every board provisioned once
+    # before the fix unable to finish a re-run. Phase 2 needs the network for install.sh anyway.
     if [ -n "$RKAIQ" ] && [ "$RKAIQ" != 0 ]; then
-        if [ -x "$RKAIQ_SELF" ]; then
-            "$RKAIQ_SELF"
-        else
-            tmp=/tmp/setup-rkaiq.sh
-            fetch setup-rkaiq.sh "$tmp"
-            fetch rkaiq-modinfo-shim.c /tmp/rkaiq-modinfo-shim.c
-            sh "$tmp"
-        fi
+        tmp=/tmp/setup-rkaiq.sh
+        fetch setup-rkaiq.sh "$tmp"
+        fetch rkaiq-modinfo-shim.c /tmp/rkaiq-modinfo-shim.c
+        sh "$tmp"
     fi
 
     # This run is what retires the wifi backstop. Left armed, any later boot where wifi is
@@ -610,17 +658,57 @@ phase_two() {
     DUCK_REF="$REF"
     DUCK_TOKEN="$TOKEN"
     DUCK_FORCE_REINSTALL="$FORCE_REINSTALL"
-    export DUCK_REPO DUCK_REF DUCK_TOKEN DUCK_FORCE_REINSTALL
+    DUCK_BOARD="$BOARD"
+    export DUCK_REPO DUCK_REF DUCK_TOKEN DUCK_FORCE_REINSTALL DUCK_BOARD
     if [ -n "$DEV_KEY" ]; then
         DUCK_DEV_KEY="$DEV_KEY"
         export DUCK_DEV_KEY
     fi
     sh "$tmp"
 
-    apply_asked_ref
+    # Naming first: it needs nothing from the branch build, and a branch apply that fails is fatal
+    # — which, in the other order, cost a board the one thing its operator typed.
     name_the_robot
+    apply_asked_ref
 
     finish
+}
+
+# Wait for the restarts an apply deferred to land: the transient `systemd-run` timers `updaterd`
+# schedules for itself and `btd` once its reply is on the wire (`RESTART_AFTER_REPLYING` in
+# `updater/src/engine.rs`). An *active* timer is one that is pending or whose restart is still
+# running, so an empty list means both have happened.
+#
+# Matched by what they run rather than by name, since systemd names them `run-r<random>`. Not
+# fatal on a timeout: a stuck timer is worth a warning, and the apply that follows says whether
+# updaterd is usable.
+wait_for_deferred_restarts() {
+    waited=0
+    while systemctl list-units --type=timer --state=active --plain --no-legend 'run-*.timer' \
+            2>/dev/null | grep -q 'systemctl restart'; do
+        if [ "$waited" -ge 60 ]; then
+            warn "a deferred restart is still pending after 60s; carrying on:
+$(systemctl list-units --type=timer --state=active --plain --no-legend 'run-*.timer' 2>/dev/null)"
+            return 0
+        fi
+        waited=$((waited + 1))
+        sleep 1
+    done
+}
+
+# Wait for `updaterd` to answer. `update status` answering means it is up and serving, which is
+# the earliest point at which anything can be asked of it.
+wait_for_updaterd() {
+    waited=0
+    until robotctl update status >/dev/null 2>&1; do
+        if [ "$waited" -ge 90 ]; then
+            die "updaterd did not answer within 90s. The board may be mid-rollback. Look at:
+    journalctl -u updaterd -b --no-pager
+    robotctl health"
+        fi
+        waited=$((waited + 2))
+        sleep 2
+    done
 }
 
 # Install the daemon that `--ref BRANCH` last built, when a branch was asked for.
@@ -644,6 +732,14 @@ apply_asked_ref() {
 
     say "installing the daemon that ${ASKED_REF} last built"
 
+    # `install.sh`'s bootstrap apply ends like every apply: `updaterd` and `btd` restarted by
+    # transient `systemd-run` timers "five seconds" later. Observed on a fresh board, that timer
+    # fired seventeen seconds later instead — four seconds into this apply, killing the updaterd
+    # performing it, so the branch build died at `Extracting` and the board stayed on stable.
+    # So let the restarts land first, then wait for updaterd to answer again.
+    wait_for_deferred_restarts
+    wait_for_updaterd
+
     # **The exit status is not the verdict, and cannot be.** The release`s `hooks/postinstall`
     # restarts `updaterd`, which is the process streaming progress back — so a *successful* apply
     # ends with `updaterd closed the connection` and a non-zero exit, every time. Treating that as
@@ -653,23 +749,11 @@ apply_asked_ref() {
   drops the connection carrying the reply. What is actually running is the verdict, below."
     fi
 
-    # Wait for the restarted daemons before reading anything, or this samples mid-swap. `update
-    # status` answering means `updaterd` is back and serving, which is the earliest point at which
-    # the question can be asked at all.
-    waited=0
-    while [ "$waited" -lt 90 ]; do
-        if robotctl update status >/dev/null 2>&1; then
-            break
-        fi
-        waited=$((waited + 2))
-        sleep 2
-    done
-    if [ "$waited" -ge 90 ]; then
-        die "updaterd did not come back within 90s of installing the ${ASKED_REF} build.
-  The board may be mid-rollback. Look at:
-    journalctl -u updaterd -b --no-pager
-    robotctl health"
-    fi
+    # Wait for the restarted daemons before reading anything, or this samples mid-swap. The same
+    # two waits as above, for this apply's own deferred restarts: `update status` answering
+    # alone can be the *old* updaterd, in the five seconds before its timer fires.
+    wait_for_deferred_restarts
+    wait_for_updaterd
 
     # And then a moment more: the health gate runs *after* the swap, so a build that fails it is
     # rolled back seconds later. Reading `current` the instant updaterd answers can catch the new
@@ -732,6 +816,7 @@ ${_stored}"
 finish() {
     rm -f "$STATE"
     say "provisioning complete; removed ${STATE}"
+    say_outcome "done"
 
     _dropin=/etc/systemd/system/updaterd.service.d/token.conf
     if [ -n "$TOKEN" ]; then
@@ -786,6 +871,11 @@ main() {
         say "resumed by systemd after the reboot; logging to ${LOG}"
     fi
 
+    trap 'on_exit $?' EXIT
+    # A signal skips an EXIT trap in dash unless it is turned into an exit first.
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
     if load_state; then
         if same_boot_as_phase_one; then
             die "phase 1 has run but this board has not rebooted since.
@@ -797,6 +887,9 @@ main() {
     sudo ${SELF}"
         fi
         persist_self
+        if [ "$RESUMED" != 1 ]; then
+            restart_log
+        fi
         phase_two
         return 0
     fi

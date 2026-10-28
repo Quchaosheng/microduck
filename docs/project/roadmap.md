@@ -152,16 +152,13 @@ One thing to fix before a duck ships with this: the token carries every scope Hu
 because the first-party device-code client takes no `scope` parameter. Narrowing it to
 `openid profile read-repos` is a public OAuth app in the org and one constant.
 
-**The SDK, and a small Python client.** §5.3 designs it as WebSocket plus snapshot: the same
-JSON-RPC, no media stack, `get_frame` returning a JPEG, a few dozen lines — and `mediad`'s
-session layer was built so that surface reuses it unchanged (`mediad/src/session.rs`). A Python
-client over **WebRTC** instead gets live video and the `control` datachannel from one
-connection, at the cost of `aiortc`, an ICE negotiation and a signalling round trip for a caller
-who only wants to send an intent and read a frame. **The investigation is whether one client
-covers both** — WebSocket for control and snapshots, WebRTC only when the caller asks for a
-stream — or whether the WebSocket surface alone is what a script wants and live video stays in
-the console. Answer that before writing either, because it decides whether the SDK is fifty
-lines or a project.
+**The SDK, and a small Python client.** The transport question is answered: control goes over
+the rendezvous control lane
+([`remote-access-design.md`](../design/remote-access-design.md) §3.8), which is JSON-RPC over
+HTTP with no WebRTC and reaches a duck from a data centre. Video is an optional extra over WebRTC,
+with `media.stream` as the fallback. `spaces/shared/` already holds the three pieces —
+`rendezvous.py` to find a duck, `wire.py` to carry calls, `control.py` to match answers — so the
+SDK is those, packaged, with the Spaces importing it rather than keeping their own copy.
 
 **Privacy, and it is now two items rather than one.** *Consent* — explicit per-session approval
 before a stream starts — is a `mediad` session-layer change and is not blocked on anything. The
@@ -189,7 +186,8 @@ difficulty — the items with the least code have the longest lead.
   a release whose daemons cannot start, which is the only path that matters. Cheapest item here:
   one board, one deliberately broken release.
 - **Consent**, from M5.
-- **Manifest staleness reporting** (§8.4.2).
+- ~~**Manifest staleness reporting**~~ (§8.4.2), **done**: `robotctl health` says when the
+  update source last answered and why the last check failed, and warns after a week of silence.
 - **Authority arbitration**, finished — including the edge #52 surfaced: `Call::is_mutating()`
   does not cover `robot.enable`, so the call that starts a policy running on a walking robot is
   classified alongside `hello`.

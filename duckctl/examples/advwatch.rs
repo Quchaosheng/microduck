@@ -16,6 +16,20 @@
 //!
 //! Reads as: arrivals per device with signal strength, then a one-character-per-second timeline for
 //! the robot, then the gaps. A gap as long as `duckctl`'s scan window is a run that reports no robot.
+//!
+//! ## How long the name takes
+//!
+//! The name is not in the advertisement — there is no room for it (`duck_ble::adv`) — so it arrives
+//! in the scan response, a second packet the client has to ask for and can miss on its own. A robot
+//! heard without one is the `(no name)` line in `duckctl scan`. So this also prints when the first
+//! scan response carrying the name arrived, counted from the first sighting.
+//!
+//! That is read from `advertisement_name` rather than `local_name`, because `local_name` falls back
+//! to the name the OS cached from an earlier run, and a cached name answers at once whether or not a
+//! scan response ever arrives. On macOS `advertisement_name` is only ever this process's scan
+//! responses, so the number is clean. On Linux it is BlueZ's `Device1.Name`, which BlueZ keeps
+//! across runs too: `bluetoothctl remove <address>` before a run, or the name is there from the
+//! first sighting and the measurement says nothing.
 
 use std::time::{Duration, Instant};
 
@@ -56,6 +70,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     let mut robot: Option<String> = None;
     let mut hits: Vec<f64> = Vec::new();
+    // First sighting, and when a scan response carrying the name first arrived after it.
+    let mut sighted: Option<f64> = None;
+    let mut named: Option<f64> = None;
     let mut total = 0usize;
     // Per-device counts, so the robot's rate is read against the other radios in the same room
     // rather than against a guess at what "normal" is. This is the control, and it is the reason the
@@ -122,12 +139,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if robot.is_none() {
             robot = Some(id.to_string());
+            sighted = Some(now);
             eprintln!(
-                "  first sighting at {:.1}s: id={} name={:?} services={}",
-                start.elapsed().as_secs_f64(),
+                "  first sighting at {now:.1}s: id={} name={:?} from a scan response={:?} \
+                 services={}",
                 id,
                 properties.local_name,
+                properties.advertisement_name,
                 properties.services.len()
+            );
+        }
+        if named.is_none() && properties.advertisement_name.is_some() {
+            named = Some(now);
+            eprintln!(
+                "  name from a scan response at {now:.1}s: {:?}",
+                properties.advertisement_name
             );
         }
         hits.push(start.elapsed().as_secs_f64());
@@ -181,6 +207,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if hits.is_empty() {
         println!("the robot was never heard from in {WATCH:?}");
         return Ok(());
+    }
+    // Against `duckctl`'s eight seconds: a name later than that from the first sighting is a
+    // `(no name)` line even for a robot heard at the very start of the scan.
+    match (sighted, named) {
+        (Some(sighted), Some(named)) => println!(
+            "the name arrived {:.1}s after the first sighting",
+            named - sighted
+        ),
+        _ => println!("no scan response carried the name in {WATCH:?}"),
     }
 
     // One character per second: '#' is a second with at least one report, '.' is silence. The gap

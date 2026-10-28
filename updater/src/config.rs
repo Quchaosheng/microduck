@@ -35,12 +35,17 @@ pub struct Config {
     /// see `docs/design/updater-design.md` §5.4.
     pub trusted_keys_dir: PathBuf,
 
-    /// Single forward-compatibility guard. An artifact declaring a higher
-    /// `min_hw_rev` than this is refused.
+    /// The hardware revision a release's `min_hw_rev` is checked against, for a robot whose
+    /// `robotd.toml` declares no board.
     ///
-    /// v1 targets one hardware configuration, so this is deliberately one
-    /// integer and not a capability matrix (`docs/design/updater-design.md` §5.6).
-    pub hw_rev: u32,
+    /// The board is the answer when there is one ([`Config::hw_rev`]). This is what every robot
+    /// installed before the board was a setting carries — `hw_rev = 1`, which is what its board
+    /// is — and what a board provisioned against a release that still shipped it carries too,
+    /// which is why it cannot win: a beta would be revision 1 for good, since the installer never
+    /// rewrites this file. One integer and not a capability matrix
+    /// (`docs/design/updater-design.md` §5.6).
+    #[serde(default)]
+    pub hw_rev: Option<u32>,
 
     /// Engine-owned state: lock file, update log, boot counter. Must NOT be
     /// inside any component's `install_dir` — it has to survive every swap and
@@ -171,6 +176,14 @@ pub struct ComponentConfig {
     /// Refuse anything but this version. Set by `robotctl pin`.
     #[serde(default)]
     pub pinned: Option<semver::Version>,
+
+    /// Files required in the extracted artifact before hooks run or the release becomes live.
+    #[serde(default)]
+    pub required_files: Vec<PathBuf>,
+
+    /// Maximum compressed artifact size. When set, the signed manifest must declare a size.
+    #[serde(default)]
+    pub max_artifact_bytes: Option<u64>,
 }
 
 fn default_keep_previous() -> usize {
@@ -370,6 +383,24 @@ impl Config {
         Ok(config)
     }
 
+    /// The hardware revision this robot is: the board `robotd.toml` declares, else this file's
+    /// `hw_rev`, else `zero3`'s.
+    ///
+    /// Read from the file every time rather than once at startup, so `robotctl configure`
+    /// applies without restarting `updaterd`.
+    pub fn hw_rev(&self) -> u32 {
+        self.hw_rev_given(robotd_params::board::Board::declared(std::path::Path::new(
+            robotd_params::DEFAULT_PATH,
+        )))
+    }
+
+    fn hw_rev_given(&self, declared: Option<robotd_params::board::Board>) -> u32 {
+        declared
+            .map(robotd_params::board::Board::hw_rev)
+            .or(self.hw_rev)
+            .unwrap_or_else(|| robotd_params::board::Board::default().hw_rev())
+    }
+
     /// Bounds applied when extracting an artifact.
     pub fn archive_limits(&self) -> crate::verify::ArchiveLimits {
         let defaults = crate::verify::ArchiveLimits::default();
@@ -399,6 +430,24 @@ impl Config {
         }
 
         for (name, component) in &self.components {
+            for required in &component.required_files {
+                if required.as_os_str().is_empty()
+                    || !required
+                        .components()
+                        .all(|part| matches!(part, std::path::Component::Normal(_)))
+                {
+                    return bad(format!(
+                        "component {name}: required_files entry {} must be a nonempty relative file path without ..",
+                        required.display()
+                    ));
+                }
+            }
+            if component.max_artifact_bytes == Some(0) {
+                return bad(format!(
+                    "component {name}: max_artifact_bytes must be positive"
+                ));
+            }
+
             // A relative install_dir would resolve against the daemon's cwd,
             // which systemd does not guarantee.
             if !component.install_dir.is_absolute() {
@@ -776,6 +825,29 @@ mod tests {
         assert!(AutoApply::All.permits(false));
     }
 
+    /// A declared board is the answer, whatever `hw_rev` says: a beta provisioned against a
+    /// release whose `updater.toml` still carried `hw_rev = 1` must not stay revision 1. Without
+    /// a board, `hw_rev` is the answer, and without either it is the zero3.
+    #[test]
+    fn the_declared_board_wins_over_hw_rev() {
+        use robotd_params::board::Board;
+        let base = r#"
+            trusted_keys_dir = "/etc/robot/keys"
+            state_dir = "/var/lib/robot/updater"
+            [component.daemon]
+            install_dir = "/opt/robot/daemon"
+            source = { type = "local_dir", path = "/var/tmp/rel" }
+            on_apply = { action = "none" }
+        "#;
+        let bare = Config::from_toml(base).unwrap();
+        assert_eq!(bare.hw_rev_given(None), Board::Zero3.hw_rev());
+        assert_eq!(bare.hw_rev_given(Some(Board::Beta)), Board::Beta.hw_rev());
+
+        let legacy = Config::from_toml(&format!("hw_rev = 1\n{base}")).unwrap();
+        assert_eq!(legacy.hw_rev_given(None), 1);
+        assert_eq!(legacy.hw_rev_given(Some(Board::Beta)), Board::Beta.hw_rev());
+    }
+
     /// A board's config says nothing about the policy library and must keep getting the board's
     /// path; a twin's says where it can actually write, and must be believed. Both halves matter:
     /// the default is what every release depends on, and the override is the whole reason this
@@ -952,6 +1024,30 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("no rollback target"), "got: {err}");
+    }
+
+    #[test]
+    fn component_guards_reject_invalid_paths_and_zero_budget() {
+        for setting in [
+            "required_files = ['']",
+            "required_files = ['.']",
+            "required_files = ['/bin/worker']",
+            "required_files = ['../worker']",
+            "required_files = ['bin/../../worker']",
+            "max_artifact_bytes = 0",
+        ] {
+            let err = config_with(&format!(
+                r#"
+                [component.daemon]
+                install_dir = "/opt/robot/daemon"
+                source = {{ type = "local_dir", path = "/var/tmp/rel" }}
+                on_apply = {{ action = "none" }}
+                {setting}
+                "#
+            ))
+            .unwrap_err();
+            assert!(matches!(err, crate::Error::Config(_)), "{setting}: {err}");
+        }
     }
 
     #[test]

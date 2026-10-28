@@ -2,8 +2,8 @@
 //!
 //! Transport-agnostic on purpose: this takes lines in and gives lines out, and knows nothing about
 //! datachannels. That is what makes it testable without a WebRTC peer — the tests below drive it
-//! over channels against fake daemons on real unix sockets — and it is also what would let a
-//! WebSocket surface (`remote-webrtc.md` §11) reuse it unchanged.
+//! over channels against fake daemons on real unix sockets — and it is also what lets the
+//! rendezvous control lane (`remote-access-design.md` §3.8) reuse it unchanged.
 //!
 //! ## What it does not do
 //!
@@ -60,7 +60,7 @@ const STREAM_METHOD: &str = "media.stream";
 /// What this daemon can answer about its own media, when it has a pipeline to answer from.
 ///
 /// One handle rather than two Options, because the two arrive together: both are known only once
-/// the pipeline is up — `sensor_mode()` is not truthful before then, and there are no frames to
+/// the pipeline is up — `pinned_sensor()` is not truthful before then, and there are no frames to
 /// encode either — and both are absent for the same reasons, a board with no camera or a lane
 /// opened before the pipeline started. A peer asking either gets a refusal that says which.
 #[derive(Clone)]
@@ -132,6 +132,8 @@ pub async fn run(
     mut pool: Pool,
     media: Option<Media>,
 ) {
+    // A peer that came with the video is a visit, and how long it stays is video streamed.
+    let _visit = media.is_some().then(crate::vetbook::visit);
     while let Some(line) = inbound.recv().await {
         let line = line.trim().to_string();
         if line.is_empty() {
@@ -386,7 +388,7 @@ mod tests {
                     height: 720,
                     rotate: 90,
                     intrinsics: crate::camera::Intrinsics::nominal(
-                        Some(crate::camera::SensorMode::PINNED),
+                        Some(&crate::sensor::IMX219),
                         1280,
                         720,
                     ),
@@ -585,11 +587,7 @@ mod tests {
             width: 1280,
             height: 720,
             rotate: 90,
-            intrinsics: crate::camera::Intrinsics::nominal(
-                Some(crate::camera::SensorMode::PINNED),
-                1280,
-                720,
-            ),
+            intrinsics: crate::camera::Intrinsics::nominal(Some(&crate::sensor::IMX219), 1280, 720),
         });
         let parsed: serde_json::Value = serde_json::from_str(&line).expect("valid json");
         assert_eq!(parsed["method"], "media.video");

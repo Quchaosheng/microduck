@@ -100,6 +100,12 @@ const fn feature(key: &'static str, kind: Kind, doc: &'static str) -> Entry {
 
 /// Every key, grouped by section, sections in the shipped file's order.
 pub const REGISTRY: &[Entry] = &[
+    // ── [board] ──────────────────────────────────────────────────────────────
+    entry(
+        "board.version",
+        Kind::Choice(crate::board::BOARD_LABELS),
+        "Which electronic board this robot is built on — set when it is provisioned",
+    ),
     // ── [bus] ────────────────────────────────────────────────────────────────
     entry("bus.port", Kind::Text, "Dynamixel serial port device"),
     // Not a feature switch, though it is a `Bool`: the front page is "what does this robot
@@ -121,6 +127,11 @@ pub const REGISTRY: &[Entry] = &[
         "control.head_alpha",
         Kind::Float,
         "EMA smoothing on head targets, 1.0 = pass-through",
+    ),
+    entry(
+        "control.publish_velocity_and_load",
+        Kind::Bool,
+        "Put measured joint velocity and load on the state stream",
     ),
     // ── [update_gate] ────────────────────────────────────────────────────────
     entry(
@@ -147,8 +158,8 @@ pub const REGISTRY: &[Entry] = &[
     feature(
         "policy.mode",
         Kind::Choice(&["walk", "roller"]),
-        "Legs or the roller: picks policies and tuning. Held DPad-Up switches it live; this is \
-         the mode a reboot comes back in",
+        "Legs or the roller: picks policies and tuning. `robot.setMode` switches it live; this \
+         is the mode a reboot comes back in",
     ),
     entry(
         "policy.skill",
@@ -285,6 +296,11 @@ pub const REGISTRY: &[Entry] = &[
         "How long the fall verdict holds before the gains drop",
     ),
     entry(
+        "safety.limp_fall_arm_ms",
+        Kind::Integer,
+        "How long the robot must stand before a fall can fire",
+    ),
+    entry(
         "safety.limp_fall_still_rate",
         Kind::Float,
         "Angular rate below which the robot counts as landed, rad/s",
@@ -336,6 +352,166 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Bool,
         "Sing with nearby ducks — off means silent AND invisible on the air",
     ),
+    // ── [idle] ───────────────────────────────────────────────────────────────
+    feature(
+        "idle.enabled",
+        Kind::Bool,
+        "Look around while nothing is happening",
+    ),
+    entry(
+        "idle.after_s",
+        Kind::Float,
+        "Seconds still before it starts looking around",
+    ),
+    entry("idle.fade_s", Kind::Float, "Seconds to fade in, and out"),
+    entry(
+        "idle.glance_yaw",
+        Kind::Float,
+        "Furthest a glance turns left or right, radians",
+    ),
+    entry(
+        "idle.glance_pitch",
+        Kind::Float,
+        "Furthest a glance tips up or down, radians",
+    ),
+    entry(
+        "idle.glance_neck",
+        Kind::Float,
+        "Furthest a glance leans the neck forward or back, radians",
+    ),
+    entry(
+        "idle.glance_mouth",
+        Kind::Float,
+        "How far a look opens the beak at most, 0..1",
+    ),
+    entry(
+        "idle.tilt_roll",
+        Kind::Float,
+        "The curious sideways tilt, radians",
+    ),
+    entry(
+        "idle.tilt_chance",
+        Kind::Float,
+        "How often a glance comes with the tilt, 0..1",
+    ),
+    entry(
+        "idle.centre_chance",
+        Kind::Float,
+        "How often a glance goes back to the middle, 0..1",
+    ),
+    entry(
+        "idle.glance_min",
+        Kind::Float,
+        "Least a new look moves from the last, radians",
+    ),
+    entry(
+        "idle.hold_min_s",
+        Kind::Float,
+        "Shortest look before picking somewhere new, seconds",
+    ),
+    entry(
+        "idle.hold_max_s",
+        Kind::Float,
+        "Longest look before picking somewhere new, seconds",
+    ),
+    entry(
+        "idle.move_min_s",
+        Kind::Float,
+        "Seconds a move takes, plus move_s_per_rad per radian",
+    ),
+    entry(
+        "idle.move_s_per_rad",
+        Kind::Float,
+        "Extra seconds a move takes per radian travelled",
+    ),
+    entry(
+        "idle.nudge_yaw",
+        Kind::Float,
+        "Small gaze shifts while holding a look, yaw radians; 0 = none",
+    ),
+    entry(
+        "idle.nudge_pitch",
+        Kind::Float,
+        "Small gaze shifts while holding a look, pitch radians; 0 = none",
+    ),
+    entry(
+        "idle.nudge_every_min_s",
+        Kind::Float,
+        "Shortest gap between those shifts, seconds",
+    ),
+    entry(
+        "idle.nudge_every_max_s",
+        Kind::Float,
+        "Longest gap between those shifts, seconds",
+    ),
+    entry(
+        "idle.drift",
+        Kind::Float,
+        "Slow drift on every head axis, radians",
+    ),
+    entry(
+        "idle.drift_hz",
+        Kind::Float,
+        "How fast the drift wanders, Hz",
+    ),
+    entry(
+        "idle.breath_m",
+        Kind::Float,
+        "Breath, metres of body height (standing network only)",
+    ),
+    entry("idle.breath_period_s", Kind::Float, "Seconds per breath"),
+    entry(
+        "idle.doze_tau_s",
+        Kind::Float,
+        "Seconds until it has mostly calmed down",
+    ),
+    entry(
+        "idle.doze_floor",
+        Kind::Float,
+        "How calm it gets, 0..1 — 1 never dozes",
+    ),
+    entry(
+        "idle.yawn_after_s",
+        Kind::Float,
+        "Seconds idle before it may yawn",
+    ),
+    entry(
+        "idle.yawn_every_s",
+        Kind::Float,
+        "About how often it yawns after that, seconds; 0 = never",
+    ),
+    entry("idle.yawn_s", Kind::Float, "How long a yawn lasts, seconds"),
+    entry(
+        "idle.yawn_open",
+        Kind::Float,
+        "How far a yawn opens the mouth, 0..1",
+    ),
+    entry(
+        "idle.yawn_pitch",
+        Kind::Float,
+        "How far a yawn tips the head, radians; negative is up",
+    ),
+    // ── [pickup] ─────────────────────────────────────────────────────────────
+    feature(
+        "pickup.enabled",
+        Kind::Bool,
+        "Pause the policy while the robot is held, resume when put down",
+    ),
+    entry(
+        "pickup.model",
+        Kind::OptionalPath,
+        "Pick-up classifier; unset = the release's copy",
+    ),
+    entry(
+        "pickup.pause_threshold",
+        Kind::Float,
+        "Pause above this p(held), held for 100 ms",
+    ),
+    entry(
+        "pickup.resume_threshold",
+        Kind::Float,
+        "Resume below this p(held), held for 80 ms — higher resumes sooner after a put-down",
+    ),
     // ── [theremin] ───────────────────────────────────────────────────────────
     feature(
         "theremin.enabled",
@@ -372,7 +548,7 @@ pub const REGISTRY: &[Entry] = &[
     feature(
         "head_imu.enabled",
         Kind::Bool,
-        "Read the head IMU (BMI088) at all — off by default; ~4% of a core when on",
+        "Read the head IMU at all — default off on zero3 (BMI088, ~4% of a core), on on beta (LSM6DSV16X, fused on the chip)",
     ),
     // ── [audio] ──────────────────────────────────────────────────────────────
     feature(
@@ -435,6 +611,11 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Choice(crate::CONGESTION_LABELS),
         "Adapt the send rate to the link — disabled costs adaptivity and saves a core's worth",
     ),
+    entry(
+        "media.sensor",
+        Kind::Choice(crate::MEDIA_SENSOR_LABELS),
+        "Head camera sensor — board follows the declared board; naming one forces it",
+    ),
     // ── [pad] ────────────────────────────────────────────────────────────────
     //
     // Which button runs which skill. Read by `padd`, not by `robotd` — but it lives in the same
@@ -445,10 +626,15 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Text,
         "Skill on the A button — `robotctl policy list` names what this robot has",
     ),
-    feature("pad.x", Kind::Text, "Skill on the X button"),
+    feature("pad.b", Kind::Text, "Skill on the B button"),
+    feature(
+        "pad.x",
+        Kind::Text,
+        "Skill on the X button — re-sent while held",
+    ),
+    feature("pad.y", Kind::Text, "Skill on the Y button"),
     feature("pad.lb", Kind::Text, "Skill on the left bumper"),
     feature("pad.rb", Kind::Text, "Skill on the right bumper"),
-    feature("pad.dpad_down", Kind::Text, "Skill on D-pad down"),
     // ── [pad_imu_head_control] ───────────────────────────────────────────────
     //
     // Controller-IMU head control. Read by `padd`, like `[pad]`. Not `[head_imu]`, which is
@@ -456,12 +642,451 @@ pub const REGISTRY: &[Entry] = &[
     feature(
         "pad_imu_head_control.enabled",
         Kind::Bool,
-        "Y poses the head from the pad's own IMU (Pro Controller) — sticks keep driving; Y again holds, again re-centres",
+        "In head + move mode (D-pad right), the pad's own IMU (Pro Controller) poses the head while the sticks drive; D-pad right again re-centres",
     ),
     entry(
         "pad_imu_head_control.gain",
         Kind::Float,
         "Head radians per pad radian — 1 follows the pad exactly, more amplifies the wrist",
+    ),
+    // ── [pad_drive] ──────────────────────────────────────────────────────────
+    //
+    // What full stick deflection asks for while walking. Read by `padd`, like `[pad]`. Signed
+    // bounds in the robot's frame: a `_min` is negative.
+    entry("pad_drive.vx_max", Kind::Float, "Full stick forward, m/s"),
+    entry(
+        "pad_drive.vx_min",
+        Kind::Float,
+        "Full stick back, m/s — negative (-0.2 is 0.2 m/s backward)",
+    ),
+    entry(
+        "pad_drive.vy_max",
+        Kind::Float,
+        "Full stick left (strafe), m/s",
+    ),
+    entry(
+        "pad_drive.vy_min",
+        Kind::Float,
+        "Full stick right (strafe), m/s — negative",
+    ),
+    entry("pad_drive.vyaw_max", Kind::Float, "Full turn left, rad/s"),
+    entry(
+        "pad_drive.vyaw_min",
+        Kind::Float,
+        "Full turn right, rad/s — negative",
+    ),
+    // ── [pad_axes], [pad_head], [pad_body], [pad_roller] ───────────────────────
+    //
+    // Which stick drives which command, and how far. Live in padd and netpadd, like [pad].
+    entry(
+        "pad_axes.deadzone",
+        Kind::Float,
+        "Stick deflection below this counts as centre, 0–1",
+    ),
+    entry(
+        "pad_axes.drive.vx.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Drive (D-pad left): stick axis for forward speed, or none",
+    ),
+    entry(
+        "pad_axes.drive.vx.invert",
+        Kind::Bool,
+        "Drive (D-pad left): reverse the forward speed stick",
+    ),
+    entry(
+        "pad_axes.drive.vx.gain",
+        Kind::Float,
+        "Drive (D-pad left): forward speed sensitivity, ≥ 0 — above 1 reaches the limit early",
+    ),
+    entry(
+        "pad_axes.drive.vy.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Drive (D-pad left): stick axis for strafe, or none",
+    ),
+    entry(
+        "pad_axes.drive.vy.invert",
+        Kind::Bool,
+        "Drive (D-pad left): reverse the strafe stick",
+    ),
+    entry(
+        "pad_axes.drive.vy.gain",
+        Kind::Float,
+        "Drive (D-pad left): strafe sensitivity, ≥ 0 — above 1 reaches the limit early",
+    ),
+    entry(
+        "pad_axes.drive.vyaw.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Drive (D-pad left): stick axis for turn, or none",
+    ),
+    entry(
+        "pad_axes.drive.vyaw.invert",
+        Kind::Bool,
+        "Drive (D-pad left): reverse the turn stick",
+    ),
+    entry(
+        "pad_axes.drive.vyaw.gain",
+        Kind::Float,
+        "Drive (D-pad left): turn sensitivity, ≥ 0 — above 1 reaches the limit early",
+    ),
+    entry(
+        "pad_axes.head.neck_pitch.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Head (D-pad up): stick axis for neck pitch, or none",
+    ),
+    entry(
+        "pad_axes.head.neck_pitch.invert",
+        Kind::Bool,
+        "Head (D-pad up): reverse the neck pitch stick",
+    ),
+    entry(
+        "pad_axes.head.neck_pitch.gain",
+        Kind::Float,
+        "Head (D-pad up): neck pitch sensitivity, ≥ 0 — above 1 reaches the limit early",
+    ),
+    entry(
+        "pad_axes.head.head_pitch.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Head (D-pad up): stick axis for head pitch, or none",
+    ),
+    entry(
+        "pad_axes.head.head_pitch.invert",
+        Kind::Bool,
+        "Head (D-pad up): reverse the head pitch stick",
+    ),
+    entry(
+        "pad_axes.head.head_pitch.gain",
+        Kind::Float,
+        "Head (D-pad up): head pitch sensitivity, ≥ 0 — above 1 reaches the limit early",
+    ),
+    entry(
+        "pad_axes.head.head_yaw.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Head (D-pad up): stick axis for head yaw, or none",
+    ),
+    entry(
+        "pad_axes.head.head_yaw.invert",
+        Kind::Bool,
+        "Head (D-pad up): reverse the head yaw stick",
+    ),
+    entry(
+        "pad_axes.head.head_yaw.gain",
+        Kind::Float,
+        "Head (D-pad up): head yaw sensitivity, ≥ 0 — above 1 reaches the limit early",
+    ),
+    entry(
+        "pad_axes.head.head_roll.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Head (D-pad up): stick axis for head roll, or none",
+    ),
+    entry(
+        "pad_axes.head.head_roll.invert",
+        Kind::Bool,
+        "Head (D-pad up): reverse the head roll stick",
+    ),
+    entry(
+        "pad_axes.head.head_roll.gain",
+        Kind::Float,
+        "Head (D-pad up): head roll sensitivity, ≥ 0 — above 1 reaches the limit early",
+    ),
+    entry(
+        "pad_axes.head_drive.vx.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Head + move (D-pad right): stick axis for forward speed, or none",
+    ),
+    entry(
+        "pad_axes.head_drive.vx.invert",
+        Kind::Bool,
+        "Head + move (D-pad right): reverse the forward speed stick",
+    ),
+    entry(
+        "pad_axes.head_drive.vx.gain",
+        Kind::Float,
+        "Head + move (D-pad right): forward speed sensitivity, ≥ 0 — above 1 reaches the limit early",
+    ),
+    entry(
+        "pad_axes.head_drive.vy.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Head + move (D-pad right): stick axis for strafe, or none",
+    ),
+    entry(
+        "pad_axes.head_drive.vy.invert",
+        Kind::Bool,
+        "Head + move (D-pad right): reverse the strafe stick",
+    ),
+    entry(
+        "pad_axes.head_drive.vy.gain",
+        Kind::Float,
+        "Head + move (D-pad right): strafe sensitivity, ≥ 0 — above 1 reaches the limit early",
+    ),
+    entry(
+        "pad_axes.head_drive.vyaw.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Head + move (D-pad right): stick axis for turn, or none",
+    ),
+    entry(
+        "pad_axes.head_drive.vyaw.invert",
+        Kind::Bool,
+        "Head + move (D-pad right): reverse the turn stick",
+    ),
+    entry(
+        "pad_axes.head_drive.vyaw.gain",
+        Kind::Float,
+        "Head + move (D-pad right): turn sensitivity, ≥ 0 — above 1 reaches the limit early",
+    ),
+    entry(
+        "pad_axes.head_drive.neck_pitch.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Head + move (D-pad right): stick axis for neck pitch, or none",
+    ),
+    entry(
+        "pad_axes.head_drive.neck_pitch.invert",
+        Kind::Bool,
+        "Head + move (D-pad right): reverse the neck pitch stick",
+    ),
+    entry(
+        "pad_axes.head_drive.neck_pitch.gain",
+        Kind::Float,
+        "Head + move (D-pad right): neck pitch sensitivity, ≥ 0 — above 1 reaches the limit early",
+    ),
+    entry(
+        "pad_axes.head_drive.head_pitch.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Head + move (D-pad right): stick axis for head pitch, or none",
+    ),
+    entry(
+        "pad_axes.head_drive.head_pitch.invert",
+        Kind::Bool,
+        "Head + move (D-pad right): reverse the head pitch stick",
+    ),
+    entry(
+        "pad_axes.head_drive.head_pitch.gain",
+        Kind::Float,
+        "Head + move (D-pad right): head pitch sensitivity, ≥ 0 — above 1 reaches the limit early",
+    ),
+    entry(
+        "pad_axes.head_drive.head_yaw.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Head + move (D-pad right): stick axis for head yaw, or none",
+    ),
+    entry(
+        "pad_axes.head_drive.head_yaw.invert",
+        Kind::Bool,
+        "Head + move (D-pad right): reverse the head yaw stick",
+    ),
+    entry(
+        "pad_axes.head_drive.head_yaw.gain",
+        Kind::Float,
+        "Head + move (D-pad right): head yaw sensitivity, ≥ 0 — above 1 reaches the limit early",
+    ),
+    entry(
+        "pad_axes.head_drive.head_roll.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Head + move (D-pad right): stick axis for head roll, or none",
+    ),
+    entry(
+        "pad_axes.head_drive.head_roll.invert",
+        Kind::Bool,
+        "Head + move (D-pad right): reverse the head roll stick",
+    ),
+    entry(
+        "pad_axes.head_drive.head_roll.gain",
+        Kind::Float,
+        "Head + move (D-pad right): head roll sensitivity, ≥ 0 — above 1 reaches the limit early",
+    ),
+    entry(
+        "pad_axes.body_pose.z.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Body + head (D-pad down): stick axis for body height, or none",
+    ),
+    entry(
+        "pad_axes.body_pose.z.invert",
+        Kind::Bool,
+        "Body + head (D-pad down): reverse the body height stick",
+    ),
+    entry(
+        "pad_axes.body_pose.z.gain",
+        Kind::Float,
+        "Body + head (D-pad down): body height sensitivity, ≥ 0 — above 1 reaches the limit early",
+    ),
+    entry(
+        "pad_axes.body_pose.pitch.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Body + head (D-pad down): stick axis for body pitch, or none",
+    ),
+    entry(
+        "pad_axes.body_pose.pitch.invert",
+        Kind::Bool,
+        "Body + head (D-pad down): reverse the body pitch stick",
+    ),
+    entry(
+        "pad_axes.body_pose.pitch.gain",
+        Kind::Float,
+        "Body + head (D-pad down): body pitch sensitivity, ≥ 0 — above 1 reaches the limit early",
+    ),
+    entry(
+        "pad_axes.body_pose.roll.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Body + head (D-pad down): stick axis for body roll, or none",
+    ),
+    entry(
+        "pad_axes.body_pose.roll.invert",
+        Kind::Bool,
+        "Body + head (D-pad down): reverse the body roll stick",
+    ),
+    entry(
+        "pad_axes.body_pose.roll.gain",
+        Kind::Float,
+        "Body + head (D-pad down): body roll sensitivity, ≥ 0 — above 1 reaches the limit early",
+    ),
+    entry(
+        "pad_axes.body_pose.neck_pitch.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Body + head (D-pad down): stick axis for neck pitch, or none",
+    ),
+    entry(
+        "pad_axes.body_pose.neck_pitch.invert",
+        Kind::Bool,
+        "Body + head (D-pad down): reverse the neck pitch stick",
+    ),
+    entry(
+        "pad_axes.body_pose.neck_pitch.gain",
+        Kind::Float,
+        "Body + head (D-pad down): neck pitch sensitivity, ≥ 0 — above 1 reaches the limit early",
+    ),
+    entry(
+        "pad_axes.body_pose.head_pitch.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Body + head (D-pad down): stick axis for head pitch, or none",
+    ),
+    entry(
+        "pad_axes.body_pose.head_pitch.invert",
+        Kind::Bool,
+        "Body + head (D-pad down): reverse the head pitch stick",
+    ),
+    entry(
+        "pad_axes.body_pose.head_pitch.gain",
+        Kind::Float,
+        "Body + head (D-pad down): head pitch sensitivity, ≥ 0 — above 1 reaches the limit early",
+    ),
+    entry(
+        "pad_axes.body_pose.head_yaw.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Body + head (D-pad down): stick axis for head yaw, or none",
+    ),
+    entry(
+        "pad_axes.body_pose.head_yaw.invert",
+        Kind::Bool,
+        "Body + head (D-pad down): reverse the head yaw stick",
+    ),
+    entry(
+        "pad_axes.body_pose.head_yaw.gain",
+        Kind::Float,
+        "Body + head (D-pad down): head yaw sensitivity, ≥ 0 — above 1 reaches the limit early",
+    ),
+    entry(
+        "pad_axes.body_pose.head_roll.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Body + head (D-pad down): stick axis for head roll, or none",
+    ),
+    entry(
+        "pad_axes.body_pose.head_roll.invert",
+        Kind::Bool,
+        "Body + head (D-pad down): reverse the head roll stick",
+    ),
+    entry(
+        "pad_axes.body_pose.head_roll.gain",
+        Kind::Float,
+        "Body + head (D-pad down): head roll sensitivity, ≥ 0 — above 1 reaches the limit early",
+    ),
+    entry(
+        "pad_head.neck_pitch_max",
+        Kind::Float,
+        "Full-deflection neck pitch, radians",
+    ),
+    entry(
+        "pad_head.head_pitch_max",
+        Kind::Float,
+        "Full-deflection head pitch, radians",
+    ),
+    entry(
+        "pad_head.head_yaw_max",
+        Kind::Float,
+        "Full-deflection head yaw, radians",
+    ),
+    entry(
+        "pad_head.head_roll_max",
+        Kind::Float,
+        "Full-deflection head roll, radians",
+    ),
+    entry(
+        "pad_body.z_min",
+        Kind::Float,
+        "Full crouch, metres — negative",
+    ),
+    entry("pad_body.z_max", Kind::Float, "Full rise, metres"),
+    entry(
+        "pad_body.pitch_max",
+        Kind::Float,
+        "Full-deflection body pitch, radians",
+    ),
+    entry(
+        "pad_body.roll_max",
+        Kind::Float,
+        "Full-deflection body roll, radians",
+    ),
+    entry(
+        "pad_roller.vx_max",
+        Kind::Float,
+        "On wheels: full push, m/s",
+    ),
+    entry(
+        "pad_roller.vx_min",
+        Kind::Float,
+        "On wheels: full brake, m/s — negative",
+    ),
+    entry(
+        "pad_roller.vy_max",
+        Kind::Float,
+        "On wheels: full strafe left, m/s",
+    ),
+    entry(
+        "pad_roller.vy_min",
+        Kind::Float,
+        "On wheels: full strafe right, m/s — negative",
+    ),
+    entry(
+        "pad_roller.vyaw_max",
+        Kind::Float,
+        "On wheels: full turn left, rad/s",
+    ),
+    entry(
+        "pad_roller.vyaw_min",
+        Kind::Float,
+        "On wheels: full turn right, rad/s — negative",
+    ),
+    // ── [netpad] ─────────────────────────────────────────────────────────────
+    //
+    // The pad over UDP. `enabled` picks between `padd` and `netpadd`; restart both after.
+    entry(
+        "netpad.enabled",
+        Kind::Bool,
+        "Drive from UDP (netpadd) instead of the Bluetooth pad (padd) — restart both after",
+    ),
+    entry("netpad.port", Kind::Integer, "UDP port netpadd listens on"),
+    entry(
+        "netpad.max_hz",
+        Kind::Integer,
+        "Most intent frames a second sent to robotd, 10–100",
+    ),
+    entry(
+        "netpad.stale_ms",
+        Kind::Integer,
+        "Nothing new from the UDP client for this long stops the robot — below safety.deadman_ms",
+    ),
+    entry(
+        "netpad.timeout_ms",
+        Kind::Integer,
+        "Silence after which the UDP client counts as gone — at least stale_ms",
     ),
 ];
 
@@ -528,6 +1153,22 @@ mod tests {
         fields
     }
 
+    fn collect_missing(key: &str, registry: &[&str], missing: &mut Vec<String>) {
+        if registry.contains(&key) {
+            return;
+        }
+        if registry
+            .iter()
+            .any(|entry| entry.starts_with(&format!("{key}.")))
+        {
+            for field in fields_of(key) {
+                collect_missing(&format!("{key}.{field}"), registry, missing);
+            }
+        } else {
+            missing.push(key.to_owned());
+        }
+    }
+
     /// The drift-proofing this module exists for: the registry names every key `Params`
     /// has — `Option` fields included — and nothing else. Add a field or a section and this
     /// test lists exactly the keys the registry (and so `robotctl configure`) does not know.
@@ -565,9 +1206,7 @@ mod tests {
         for section in &sections {
             for field in fields_of(section) {
                 let key = format!("{section}.{field}");
-                if !registry.contains(&key.as_str()) {
-                    missing.push(key);
-                }
+                collect_missing(&key, &registry, &mut missing);
             }
         }
         assert!(
@@ -579,7 +1218,7 @@ mod tests {
         for entry in REGISTRY {
             let (section, key) = entry
                 .key
-                .split_once('.')
+                .rsplit_once('.')
                 .expect("registry keys are section.key");
             let probe = match entry.kind {
                 Kind::Bool => format!("[{section}]\n{key} = true\n"),
@@ -625,7 +1264,7 @@ mod tests {
             let Kind::Choice(choices) = entry.kind else {
                 continue;
             };
-            let (section, key) = entry.key.split_once('.').expect("section.key");
+            let (section, key) = entry.key.rsplit_once('.').expect("section.key");
             for choice in choices {
                 let toml = format!("[{section}]\n{key} = \"{choice}\"\n");
                 assert!(
@@ -662,6 +1301,8 @@ mod tests {
                 "safety.limp_fall",
                 "duck_detector.enabled",
                 "chorale.accept",
+                "idle.enabled",
+                "pickup.enabled",
                 "theremin.enabled",
                 "head_imu.enabled",
                 "audio.enabled",
@@ -669,13 +1310,14 @@ mod tests {
                 "audio.pet_detect",
                 "media.source",
                 "media.quality",
-                // The five one-shot buttons. Front-page keys because "what does this button do"
+                // The six one-shot buttons. Front-page keys because "what does this button do"
                 // is a question somebody asks holding the pad, not while reading tuning docs.
                 "pad.a",
+                "pad.b",
                 "pad.x",
+                "pad.y",
                 "pad.lb",
                 "pad.rb",
-                "pad.dpad_down",
                 "pad_imu_head_control.enabled",
             ]
         );

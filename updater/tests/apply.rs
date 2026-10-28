@@ -513,6 +513,345 @@ async fn check_reports_availability_without_changing_anything() {
     assert_eq!(fx.live_version(), None, "check must not install anything");
 }
 
+/// Lowering a download budget must not block an installed release: no artifact is fetched.
+#[tokio::test]
+async fn component_guard_check_accepts_installed_over_budget_release() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    apply_latest(&mut fx.engine_healthy()).await.unwrap();
+    std::fs::remove_file(fx.releases.join("daemon-1.0.0.tar.zst")).unwrap();
+    let engine = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults::none(),
+        "max_artifact_bytes = 1",
+    );
+    let result = engine.check("daemon").await.unwrap();
+    assert!(
+        matches!(result, CheckResult::UpToDate { installed } if installed == semver::Version::new(1, 0, 0))
+    );
+}
+
+#[tokio::test]
+async fn component_guard_apply_accepts_installed_over_budget_release() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    apply_latest(&mut fx.engine_healthy()).await.unwrap();
+    std::fs::remove_file(fx.releases.join("daemon-1.0.0.tar.zst")).unwrap();
+    let mut engine = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults::none(),
+        "max_artifact_bytes = 1",
+    );
+    let result = apply_latest(&mut engine).await.unwrap();
+    assert!(
+        matches!(result, ApplyResult::AlreadyCurrent { version, .. } if version == semver::Version::new(1, 0, 0))
+    );
+    assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
+    assert_eq!(fx.staging_leftovers(), 0);
+}
+
+/// A signed release can still be unsuitable for a particular component. Checking and applying
+/// independently must both refuse it, before trying to fetch the artifact.
+#[tokio::test]
+async fn component_guard_refuses_over_budget_manifest_in_check_and_apply() {
+    let fx = Fixture::new();
+    fx.publish_with("1.0.0", None, |m| m["size"] = 101.into());
+    std::fs::remove_file(fx.releases.join("daemon-1.0.0.tar.zst")).unwrap();
+    let mut engine = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults::none(),
+        "max_artifact_bytes = 100",
+    );
+    let result = engine.check("daemon").await.unwrap();
+    assert!(
+        matches!(result, CheckResult::Incompatible { ref reason, .. } if reason.contains("max_artifact_bytes")),
+        "{result:?}"
+    );
+    let error = apply_exact(&mut engine, "1.0.0").await.unwrap_err();
+    assert!(
+        matches!(error, updater::Error::Incompatible(ref reason) if reason.contains("max_artifact_bytes")),
+        "{error}"
+    );
+    assert_eq!(fx.live_version(), None);
+    assert_eq!(fx.staging_leftovers(), 0);
+}
+
+#[tokio::test]
+async fn component_guard_requires_declared_size_when_budgeted() {
+    let fx = Fixture::new();
+    fx.publish_with("1.0.0", None, |m| {
+        m.as_object_mut().unwrap().remove("size");
+    });
+    let mut engine = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults::none(),
+        "max_artifact_bytes = 10000",
+    );
+    let result = engine.check("daemon").await.unwrap();
+    assert!(
+        matches!(result, CheckResult::Incompatible { .. }),
+        "{result:?}"
+    );
+    let error = apply_exact(&mut engine, "1.0.0").await.unwrap_err();
+    assert!(error.to_string().contains("size is required"), "{error}");
+    assert_eq!(fx.live_version(), None);
+}
+
+/// A declared size is an early refusal, not proof of the bytes actually downloaded.
+#[tokio::test]
+async fn component_guard_checks_actual_compressed_size() {
+    let fx = Fixture::new();
+    fx.publish_with("1.0.0", None, |m| m["size"] = 1.into());
+    let mut engine = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults::none(),
+        "max_artifact_bytes = 1",
+    );
+    assert!(matches!(
+        engine.check("daemon").await.unwrap(),
+        CheckResult::Available { .. }
+    ));
+    let error = apply_exact(&mut engine, "1.0.0").await.unwrap_err();
+    assert!(error.to_string().contains("max_artifact_bytes"), "{error}");
+    assert_eq!(fx.live_version(), None);
+    assert_eq!(fx.staging_leftovers(), 0);
+}
+
+/// An incomplete bundle must not execute even its preinstall hook, or replace a working release.
+#[tokio::test]
+async fn component_guard_requires_files_before_hooks_and_swap() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    apply_exact(&mut fx.engine_healthy(), "1.0.0")
+        .await
+        .unwrap();
+    let marker = fx.root.join("hook-ran");
+    let hook = format!("#!/bin/sh\ntouch '{}'\n", marker.display());
+    fx.publisher
+        .release("2.0.0")
+        .file("hooks/preinstall", hook.as_bytes(), 0o755)
+        .write();
+    let mut engine = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults::none(),
+        "required_files = ['bin/worker']",
+    );
+    let error = apply_exact(&mut engine, "2.0.0").await.unwrap_err();
+    assert!(
+        error.to_string().contains("required file bin/worker"),
+        "{error}"
+    );
+    assert!(!marker.exists());
+    assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
+    assert!(!fx.release_exists("2.0.0"));
+    assert_eq!(fx.staging_leftovers(), 0);
+}
+
+#[tokio::test]
+async fn component_guard_accepts_required_file_and_exact_budget() {
+    let fx = Fixture::new();
+    fx.publisher
+        .release("1.0.0")
+        .file("bin/worker", b"demo", 0o644)
+        .write();
+    let bytes = std::fs::metadata(fx.releases.join("daemon-1.0.0.tar.zst"))
+        .unwrap()
+        .len();
+    let mut engine = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults::none(),
+        &format!("required_files = ['bin/worker']\nmax_artifact_bytes = {bytes}"),
+    );
+    assert!(matches!(
+        engine.check("daemon").await.unwrap(),
+        CheckResult::Available { .. }
+    ));
+    apply_exact(&mut engine, "1.0.0").await.unwrap();
+    assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
+}
+
+#[tokio::test]
+async fn component_guard_does_not_treat_directory_as_required_file() {
+    let fx = Fixture::new();
+    fx.publisher
+        .release("1.0.0")
+        .file("bin/worker", b"demo", 0o644)
+        .write();
+    let mut engine = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults::none(),
+        "required_files = ['bin']",
+    );
+    let error = apply_exact(&mut engine, "1.0.0").await.unwrap_err();
+    assert!(error.to_string().contains("required file bin"), "{error}");
+    assert_eq!(fx.live_version(), None);
+}
+
+#[tokio::test]
+async fn component_guard_dry_run_checks_required_files() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    let mut engine = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults::none(),
+        "required_files = ['bin/worker']",
+    );
+    let (tx, _rx) = progress_channel();
+    let error = engine
+        .apply(
+            "daemon",
+            Target::Latest,
+            ApplyOptions {
+                dry_run: true,
+                ..ApplyOptions::default()
+            },
+            tx,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("required file bin/worker"),
+        "{error}"
+    );
+    assert_eq!(fx.live_version(), None);
+    assert_eq!(fx.staging_leftovers(), 0);
+}
+
+#[tokio::test]
+async fn component_guard_sideload_cannot_bypass_budget() {
+    let fx = Fixture::new();
+    fx.publish_sideload("1.0.0");
+    let mut engine = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults::none(),
+        "max_artifact_bytes = 1",
+    );
+    let (tx, _rx) = progress_channel();
+    let error = engine
+        .apply(
+            "daemon",
+            Target::Latest,
+            ApplyOptions {
+                from_dir: Some(fx.sideload()),
+                ..ApplyOptions::default()
+            },
+            tx,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("max_artifact_bytes"), "{error}");
+    assert_eq!(fx.live_version(), None);
+    assert_eq!(fx.staging_leftovers(), 0);
+}
+
+/// When `daemon`'s source last answered, as `update.status` reports it.
+async fn last_checked(engine: &Engine) -> Option<i64> {
+    engine
+        .status()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|status| status.component.to_string() == "daemon")?
+        .last_checked
+}
+
+/// How `daemon`'s last check went, as `update.status` reports it.
+async fn last_check_attempt(engine: &Engine) -> Option<updater::proto::CheckAttempt> {
+    engine
+        .status()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|status| status.component.to_string() == "daemon")?
+        .last_check_attempt
+}
+
+/// **A check that reached the source says when, and one that did not says nothing.**
+///
+/// A robot that cannot reach its source reads exactly like one with nothing to install, so when
+/// the source last answered is what `update.status` has to carry. It must move only on an answer:
+/// a failed fetch recorded as a check would hide the one case this exists to show.
+#[tokio::test]
+async fn status_says_when_the_source_last_answered() {
+    let fx = Fixture::new();
+    let engine = fx.engine_healthy();
+
+    // Nothing checked yet: no answer, and no attempt either.
+    assert_eq!(last_check_attempt(&engine).await, None);
+
+    // Nothing published, so the fetch fails, and that is not an answer — but it is an attempt,
+    // and it says why.
+    let why = engine.check("daemon").await.unwrap_err().to_string();
+    assert_eq!(last_checked(&engine).await, None);
+    let attempt = last_check_attempt(&engine)
+        .await
+        .expect("a check that failed is recorded as an attempt");
+    assert_eq!(attempt.error.as_deref(), Some(why.as_str()));
+
+    fx.publish("1.0.0", None);
+    let before = updater::journal::now_unix();
+    engine.check("daemon").await.unwrap();
+    let at = last_checked(&engine)
+        .await
+        .expect("a check that reached the source is recorded");
+    assert!(at >= before, "{at} is before the check started at {before}");
+    assert_eq!(
+        last_check_attempt(&engine).await.unwrap().error,
+        None,
+        "an answer clears the failure before it"
+    );
+}
+
+/// **A check of a component this robot does not have is not an attempt.** The name arrives over
+/// IPC, and a typo must not add an entry for it.
+#[tokio::test]
+async fn a_check_of_an_unknown_component_records_nothing() {
+    let fx = Fixture::new();
+    let engine = fx.engine_healthy();
+    engine.check("nope").await.unwrap_err();
+    let attempts = fx.root.join("var/lib/robot/updater/check-attempts.json");
+    assert!(!attempts.exists(), "{}", attempts.display());
+}
+
+/// **A manifest that does not verify is not an answer either.** The fetch worked and the signature
+/// did not, and a source serving something unsigned has told this robot nothing.
+#[tokio::test]
+async fn a_manifest_that_does_not_verify_is_not_an_answer() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    let manifest = fx.releases.join("1.0.0.manifest.json");
+    let mut bytes = std::fs::read(&manifest).unwrap();
+    bytes.push(b' ');
+    std::fs::write(&manifest, bytes).unwrap();
+    let engine = fx.engine_healthy();
+
+    engine.check("daemon").await.unwrap_err();
+    assert_eq!(last_checked(&engine).await, None);
+}
+
+/// **A sideloaded release says nothing about the source.** `--from` reads a directory on the board,
+/// and counting it would report a source that has not answered in a month as fresh the day somebody
+/// pushed a dev build. An apply of the source's own latest does count.
+#[tokio::test]
+async fn applying_from_a_directory_is_not_an_answer_from_the_source() {
+    let fx = Fixture::new();
+    fx.publish_sideload("1.0.0");
+    let mut engine = fx.engine_healthy();
+
+    apply_from(&mut engine, &fx.sideload(), Target::Latest)
+        .await
+        .unwrap();
+    assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
+    assert_eq!(last_checked(&engine).await, None);
+
+    fx.publish("2.0.0", None);
+    apply_latest(&mut engine).await.unwrap();
+    assert!(
+        last_checked(&engine).await.is_some(),
+        "an apply of the source's latest is an answer"
+    );
+}
+
 #[tokio::test]
 async fn dry_run_verifies_everything_but_does_not_swap() {
     let fx = Fixture::new();

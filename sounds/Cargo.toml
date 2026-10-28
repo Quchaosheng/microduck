@@ -16,3 +16,5 @@ anyhow = "1"
 clap = { workspace = true, features = ["derive"] }
 hound.workspace = true
 sha2 = "0.11"
+# The SoC serial the voice is seeded from, read the same way configd reads it for the name.
+robotd-params = { path = "../robotd-params" }

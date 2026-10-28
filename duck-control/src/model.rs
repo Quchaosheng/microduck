@@ -11,12 +11,9 @@
 /// Left leg (5) · neck/head/mouth (5) · right leg (5).
 pub const NUM_JOINTS: usize = 15;
 
-/// Dynamixel IDs, indexed as [`JOINT_NAMES`].
-pub const JOINT_IDS: [u8; NUM_JOINTS] = [
-    20, 21, 22, 23, 24, // left leg
-    30, 31, 32, 33, 34, // neck, head, mouth
-    10, 11, 12, 13, 14, // right leg
-];
+/// Dynamixel IDs, indexed as [`JOINT_NAMES`] — from the protocol crate too, since
+/// `robot.health` names a missing servo by its ID and a client has to say which joint it is.
+pub use duck_ipc_proto::JOINT_IDS;
 
 /// Joint names, from the protocol crate — the wire indexes `joints` and `targets`
 /// positionally, so that order and this one cannot be allowed to drift apart. The
@@ -24,6 +21,7 @@ pub const JOINT_IDS: [u8; NUM_JOINTS] = [
 pub use duck_ipc_proto::JOINT_NAMES;
 
 const _: () = assert!(JOINT_NAMES.len() == NUM_JOINTS);
+const _: () = assert!(JOINT_IDS.len() == NUM_JOINTS);
 
 /// The mouth is absent from every alpha policy — they are all 61-D observation, 14-action,
 /// and the action vector skips this index. Named so that omission is deliberate rather
@@ -52,6 +50,31 @@ pub const DEFAULT_POSITION: [f64; NUM_JOINTS] = [
     0.4579,  // right_hip_pitch
     0.0049,  // right_knee
     -0.4530, // right_ankle
+];
+
+/// Rest pose: where a seated robot settles with its torque off. Recorded on graphite-bang
+/// sitting stably untorqued (2026-10-03), averaged over a second of samples.
+///
+/// The shutdown eases the joints here from the policy's seat before cutting torque. The seat
+/// the sitstand network holds is not where the robot comes to rest once nothing holds it, so
+/// cutting torque straight from the seat let the robot sag forward. Arriving here first, it
+/// is already where it would fall to.
+pub const REST_POSITION: [f64; NUM_JOINTS] = [
+    0.3129,  // left_hip_yaw
+    0.4050,  // left_hip_roll
+    -0.2338, // left_hip_pitch
+    1.5493,  // left_knee
+    0.5522,  // left_ankle
+    0.9572,  // neck_pitch
+    1.4787,  // head_pitch
+    -0.0129, // head_yaw
+    -0.0522, // head_roll
+    -0.0121, // mouth
+    0.0353,  // right_hip_yaw
+    -0.5660, // right_hip_roll
+    0.2853,  // right_hip_pitch
+    -1.4696, // right_knee
+    -0.4096, // right_ankle
 ];
 
 /// Mouth travel, radians: closed and fully open. The alpha reuses the v1.6 range,
@@ -104,6 +127,27 @@ pub const EXPECTED_REGISTERS: &[(&str, u8)] = &[
     ("pwm_slope", 255),
     ("shutdown", 52),
 ];
+
+/// `homing_offset` on the knees, in raw position counts (0.088° each, so −45°).
+///
+/// Every other joint is at 0. The value is `microduck_runtime`'s `setup_motor_rpi.py`, the
+/// flashing rig every servo on a built robot went through, so [`DEFAULT_POSITION`] and every
+/// policy assume it. A servo straight from the box arrives at 0, so a knee adopted without this
+/// reads and drives 45° off, with nothing in the journal to say why.
+pub const KNEE_HOMING_OFFSET: i32 = -512;
+
+/// Right and left knee: the only joints whose `homing_offset` is not 0.
+pub const KNEE_IDS: [u8; 2] = [13, 23];
+
+/// The `homing_offset` a servo should hold, asserted alongside [`EXPECTED_REGISTERS`]. It is
+/// kept apart from them because it is an `i32` and differs per joint.
+pub fn homing_offset(id: u8) -> i32 {
+    if KNEE_IDS.contains(&id) {
+        KNEE_HOMING_OFFSET
+    } else {
+        0
+    }
+}
 
 /// Index of a joint by name. Linear scan over 15 entries, used at startup and in tests.
 pub fn joint_index(name: &str) -> Option<usize> {
@@ -207,6 +251,20 @@ mod tests {
             "the three faults worth latching on, with input-voltage clear"
         );
         assert_eq!(want & INPUT_VOLTAGE, 0);
+    }
+
+    /// The knee IDs are positional facts about [`JOINT_IDS`]; a renumbering that moved them
+    /// would put the offset on a hip.
+    #[test]
+    fn only_the_knees_have_a_homing_offset() {
+        for (i, &id) in JOINT_IDS.iter().enumerate() {
+            let want = if JOINT_NAMES[i].ends_with("_knee") {
+                KNEE_HOMING_OFFSET
+            } else {
+                0
+            };
+            assert_eq!(homing_offset(id), want, "{}", JOINT_NAMES[i]);
+        }
     }
 
     /// `MOUTH_INDEX` is used to skip a slot when mapping 14 policy actions onto 15 joints.

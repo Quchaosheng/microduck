@@ -106,7 +106,7 @@ ships. `../design/restart-order.md` is the full sequence, step by step.
 Skipping CI entirely: build on your machine and install over ssh, in about a minute.
 
 ```bash
-scripts/dev-push.sh radxa@<board>
+scripts/dev-push.sh microduck@<board>
 ```
 
 The result is an ordinary gated update, so the restart traps above still apply.
@@ -127,7 +127,7 @@ sudo systemctl stop padd
 Forward the socket and leave it open:
 
 ```bash
-ssh -L /tmp/robotd.sock:/run/robotd.sock radxa@192.168.1.42
+ssh -L /tmp/robotd.sock:/run/robotd.sock microduck@192.168.1.42
 ```
 
 Then from this clone, in another terminal:
@@ -136,14 +136,14 @@ Then from this clone, in another terminal:
 cargo run -p padd -- --socket /tmp/robotd.sock
 ```
 
-`systemctl start padd` puts the robot's own back. This is also where `padd`'s flags are worth
-having — `--max-linear` (m/s), `--max-angular` (rad/s), `--max-head` (radians) and `--deadzone`,
-which exists because analogue sticks rarely rest at exactly zero and the robot creeps without it.
-The unit runs with the defaults, so trying other values means running the binary yourself, here or
-on the board:
+`systemctl start padd` puts the robot's own back. The stick mapping and its limits are not flags:
+they are `[pad_drive]`, `[pad_axes]`, `[pad_head]`, `[pad_body]` and `[pad_roller]` in
+`robotd.toml`, set with `sudo robotctl configure` and picked up within a second. `--max-head`
+(radians, every head joint) and `--deadzone` remain, and win over the file while they are given,
+for trying a value without editing it:
 
 ```bash
-sudo -u padd /opt/robot/daemon/current/bin/padd --max-linear 0.25
+sudo -u padd /opt/robot/daemon/current/bin/padd --deadzone 0.15
 ```
 
 ## From a laptop — `duckctl`

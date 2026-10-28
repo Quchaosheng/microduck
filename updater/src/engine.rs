@@ -409,8 +409,8 @@ impl Engine {
 
     // ── queries ──────────────────────────────────────────────────────────────
 
-    /// Is an update available? Changes nothing.
-    pub async fn check(&self, component: &str) -> Result<CheckResult, Error> {
+    /// [`Self::check`]'s answer, before it is recorded.
+    async fn check_source(&self, component: &str) -> Result<CheckResult, Error> {
         let cfg = self.config.component(component)?;
         let store = self.store(component)?;
         let installed = store.current()?;
@@ -432,6 +432,13 @@ impl Engine {
             return Ok(CheckResult::Incompatible {
                 candidate: manifest.version,
                 reason: format!("component is pinned to {pinned}"),
+            });
+        }
+
+        if let Err(reason) = require_artifact_budget(manifest.size, cfg.max_artifact_bytes) {
+            return Ok(CheckResult::Incompatible {
+                candidate: manifest.version,
+                reason,
             });
         }
 
@@ -464,8 +471,46 @@ impl Engine {
         }
     }
 
+    /// Is an update available? Changes nothing that is installed.
+    ///
+    /// Records that the source answered, when it did, because `update.status` reports how long ago
+    /// that was ([`crate::journal::Checked`]). Every `Ok` below comes after the manifest verified
+    /// and named this component's channel; an `Err` may be the fetch, the signature or the
+    /// channel, and none of those is an answer — so it is recorded as an attempt that failed, with
+    /// the reason `robotctl health` gives for the silence.
+    pub async fn check(&self, component: &str) -> Result<CheckResult, Error> {
+        let result = self.check_source(component).await;
+        match &result {
+            Ok(_) => self.source_answered(component),
+            // Only for a component this robot has: the name arrives over IPC, and an unknown one
+            // is a mistyped command rather than a check that failed.
+            Err(e) if self.config.component(component).is_ok() => {
+                self.source_did_not_answer(component, e);
+            }
+            Err(_) => {}
+        }
+        result
+    }
+
+    /// Note that `component`'s source answered with its latest. A failure to write that down is
+    /// logged and nothing more: it is a report about updates, not part of one.
+    fn source_answered(&self, component: &str) {
+        if let Err(e) = crate::journal::Checked::open(&self.config.state_dir).record(component) {
+            tracing::warn!(component, error = %e, "could not record that the update source answered");
+        }
+    }
+
+    fn source_did_not_answer(&self, component: &str, why: &Error) {
+        if let Err(e) = crate::journal::Checked::open(&self.config.state_dir)
+            .record_failure(component, &why.to_string())
+        {
+            tracing::warn!(component, error = %e, "could not record that a check of the update source failed");
+        }
+    }
+
     pub async fn status(&self) -> Result<Vec<ComponentStatus>, Error> {
         let mut out = Vec::new();
+        let checked = crate::journal::Checked::open(&self.config.state_dir);
         for (name, cfg) in &self.config.components {
             let store = Store::new(cfg.install_dir.clone());
             // The verdict, not a boolean summary of it: `healthy` alone cannot tell a board
@@ -510,6 +555,8 @@ impl Engine {
                 reason: report.and_then(|r| r.reason),
                 pinned: self.effective_pin(name),
                 last_attempt: self.journal.last_for(name)?,
+                last_checked: checked.get(name),
+                last_check_attempt: checked.last_attempt(name),
             });
         }
         Ok(out)
@@ -714,6 +761,13 @@ impl Engine {
 
         Self::check_channel(&manifest, component)?;
 
+        // The source answered with its latest, signed and for this component: what a `check`
+        // records. Not a `--from` directory, which says nothing about the source, and not an exact
+        // version, which a source that has stopped moving still serves.
+        if options.from_dir.is_none() && matches!(target, crate::proto::Target::Latest) {
+            self.source_answered(component);
+        }
+
         if let Some(pinned) = self.effective_pin(component)
             && pinned != manifest.version
         {
@@ -735,6 +789,10 @@ impl Engine {
                 stale,
             });
         }
+
+        // `apply` can be called without `check`, including for exact versions and sideloads.
+        require_artifact_budget(manifest.size, cfg.max_artifact_bytes)
+            .map_err(Error::Incompatible)?;
 
         // Rollback-attack guard. A signature proves an artifact is *ours*; it says
         // nothing about it being *current*. A stale or reverted mirror can serve an
@@ -903,6 +961,17 @@ impl Engine {
         drop(tx_keepalive);
         let _ = pump.await;
 
+        if cfg.max_artifact_bytes.is_some() {
+            let bytes = std::fs::metadata(&fetched.artifact)
+                .map_err(|source| Error::Io {
+                    path: fetched.artifact.clone(),
+                    source,
+                })?
+                .len();
+            require_artifact_budget(Some(bytes), cfg.max_artifact_bytes)
+                .map_err(Error::Incompatible)?;
+        }
+
         if self.faults.corrupt_artifact {
             // Append a byte so the hash no longer matches — the same observable
             // condition as a truncated download or a tampered mirror.
@@ -959,6 +1028,8 @@ impl Engine {
         let dest = extract_dir.to_path_buf();
         let limits = self.config.archive_limits();
         blocking(move || verify::extract_artifact(&artifact, &dest, limits)).await?;
+
+        require_files(extract_dir, &cfg.required_files)?;
 
         // Keep the verified manifest with the release, for `select` and provenance.
         std::fs::write(extract_dir.join(EMBEDDED_MANIFEST), manifest_bytes).map_err(|e| {
@@ -1982,7 +2053,7 @@ impl Engine {
     /// [`crate::manifest::Compatibility`].
     async fn capabilities(&self) -> Capabilities {
         Capabilities {
-            hw_rev: self.config.hw_rev,
+            hw_rev: self.config.hw_rev(),
             model_api: self.robot.model_api(ROBOT_QUERY_TIMEOUT).await,
             schema_version: SUPPORTED_SCHEMA_VERSION,
         }
@@ -2995,6 +3066,72 @@ fn configured_units(cfg: &ComponentConfig) -> Vec<String> {
     match &cfg.on_apply {
         ApplyAction::Restart { units } => units.clone(),
         _ => Vec::new(),
+    }
+}
+
+fn require_artifact_budget(size: Option<u64>, maximum: Option<u64>) -> Result<(), String> {
+    let Some(maximum) = maximum else {
+        return Ok(());
+    };
+    let Some(size) = size else {
+        return Err("artifact size is required when max_artifact_bytes is configured".into());
+    };
+    if size > maximum {
+        return Err(format!(
+            "artifact is {size} bytes, above max_artifact_bytes {maximum}"
+        ));
+    }
+    Ok(())
+}
+
+/// A signed bundle may be incomplete. Check staging before hooks can run or `current` moves.
+fn require_files(root: &Path, required: &[PathBuf]) -> Result<(), Error> {
+    if required.is_empty() {
+        return Ok(());
+    }
+    let root = root.canonicalize().map_err(|source| Error::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    for relative in required {
+        let path = root.join(relative);
+        // Resolving first also prevents a link to a host file from satisfying the requirement.
+        if !path
+            .canonicalize()
+            .is_ok_and(|resolved| resolved.starts_with(&root) && resolved.is_file())
+        {
+            return Err(Error::Incompatible(format!(
+                "artifact is missing required file {} inside its extracted tree",
+                relative.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod artifact_guard_tests {
+    use super::*;
+
+    #[test]
+    fn required_file_links_must_resolve_inside_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(dir.path().join("host-file"), b"outside").unwrap();
+        std::fs::write(root.join("payload"), b"inside").unwrap();
+        let link = root.join("required");
+        std::os::unix::fs::symlink("../host-file", &link).unwrap();
+        assert!(require_files(&root, &[PathBuf::from("required")]).is_err());
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("payload", &link).unwrap();
+        require_files(&root, &[PathBuf::from("required")]).unwrap();
+    }
+
+    #[test]
+    fn absent_budget_preserves_manifests_without_size() {
+        require_artifact_budget(None, None).unwrap();
+        require_artifact_budget(Some(u64::MAX), None).unwrap();
     }
 }
 

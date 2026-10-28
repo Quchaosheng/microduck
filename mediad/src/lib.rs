@@ -7,7 +7,7 @@
 //! - [`session`] — the pipe. Lines in, lines out, replies never parsed.
 //!
 //! [`session::run`] is transport-agnostic on purpose: it takes lines and gives lines, so it is
-//! testable without a WebRTC peer and would serve a WebSocket surface (§11) unchanged.
+//! testable without a WebRTC peer, and why [`relay`]'s rendezvous control lane reuses it unchanged.
 //!
 //! - [`config`] — `[media]` in `robotd.toml`: what the stream is, edited with `robotctl configure`.
 //! - [`web`] — the console page, served by the daemon it drives. `webrtc-console.md` §1.
@@ -21,12 +21,17 @@
 /// directions, and which sensor mode they belong to.
 pub mod camera;
 pub mod config;
+/// The camera LED: lit while the picture is leaving the robot. `architecture.md` §3.2 and §7.
+pub mod indicator;
 /// The account credential `updaterd` writes, read by the two things here that need it.
 pub mod producer;
 /// The outward connection to the rendezvous service — what makes a duck reachable from off its
 /// own LAN. `docs/design/remote-access-design.md` §3.
 pub mod relay;
 pub mod route;
+/// Which camera sensor the robot has, found in the media graph, and the units and optics that go
+/// with it.
+pub mod sensor;
 pub mod session;
 mod snapshot;
 pub mod stream;
@@ -34,6 +39,7 @@ pub mod stream;
 /// hole to it. `docs/design/remote-access-design.md` §6.
 pub mod turn;
 pub mod upstream;
+pub mod vetbook;
 pub mod web;
 
 /// The GStreamer pipeline and the datachannel.

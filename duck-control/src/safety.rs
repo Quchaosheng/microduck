@@ -197,6 +197,16 @@ impl<T: RobotIo> Safety<T> {
         self.io.imu_ready()
     }
 
+    pub fn hardware_errors(&mut self) -> Result<Option<[u8; crate::model::NUM_JOINTS]>, IoError> {
+        self.io.hardware_errors()
+    }
+
+    pub fn servo_identity(
+        &mut self,
+    ) -> Result<Option<[crate::io::ServoIdentity; crate::model::NUM_JOINTS]>, IoError> {
+        self.io.servo_identity()
+    }
+
     pub fn fallen(&self) -> bool {
         self.fallen
     }
@@ -425,6 +435,20 @@ impl<T: RobotIo> Safety<T> {
         self.io.set_gain(kp)?;
         self.gain = Some(kp);
         Ok(())
+    }
+
+    /// Whether the backend measures joint velocity, and whether it measures load.
+    ///
+    /// Forwarded one bool at a time rather than by handing out the IO, which stays private for
+    /// the reason [`Self::io`] gives. The control loop needs the answer because it decides
+    /// whether those blocks go on the state stream at all, and a fabricated zero there is
+    /// indistinguishable from a robot at rest.
+    pub fn measures_velocity(&self) -> bool {
+        self.io.measures_velocity()
+    }
+
+    pub fn measures_load(&self) -> bool {
+        self.io.measures_load()
     }
 
     /// Borrow the wrapped IO. Test-only, and deliberately not public: handing this out in

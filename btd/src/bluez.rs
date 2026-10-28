@@ -33,7 +33,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bluer::adv::{Advertisement, Type};
+use bluer::adv::{Advertisement, AdvertisementHandle, SecondaryChannel, Type};
 use bluer::agent::Agent;
 // Aliased: `bluer` has two error types called `ReqError`, one for the pairing agent and one for a
 // characteristic. Naming this one makes a mix-up a name error rather than a puzzling type error,
@@ -781,10 +781,31 @@ impl std::fmt::Display for Advertised {
 /// state the robot was in before any of this existed, it resolves itself when the link drops — the
 /// kernel re-enables the instance on disconnect — and it is the reason [`reconcile_advertisement`]
 /// re-registers rather than assuming a handle means visibility.
-async fn advertise(
-    adapter: &bluer::Adapter,
-    advertised: &Advertised,
-) -> bluer::Result<bluer::adv::AdvertisementHandle> {
+///
+/// ## Why a free robot advertises twice
+///
+/// A connectable robot also registers an **extended** advertisement carrying the same payload, and
+/// that one is what a Linux laptop connects through. Measured on the board (2026-10-01): a central
+/// whose controller offers channel selection algorithm #2 — an Intel BE200, so most recent Linux
+/// laptops — never completes a connection made from the legacy advertisement. The central hops with
+/// algorithm #1, because the legacy advertisement does not offer #2; the AIC8800 hops with #2 because
+/// the central offered it. Both ends lose each other within 200 ms and report `0x3e`, *Connection
+/// Failed to be Established*, below either host, so `btd` logs nothing and BlueZ on the laptop says
+/// `le-connection-abort-by-local`. A Mac does not offer #2 there and both ends agree on #1.
+///
+/// A connection made from an extended advertisement uses #2 at both ends by the spec, so the
+/// controller's choice is the right one there whoever the central is. Measured the same day: the
+/// same laptop connected through an extended advertisement, both ends on #2, and served `info`.
+///
+/// **The legacy one stays**, because a central that cannot scan extended advertising — Bluetooth
+/// 4.x, and whatever the phone app runs on that has not been checked — would otherwise not find the
+/// robot at all. The twin carries [`duck_ble::adv::EXTENDED_MARK`] after the address, which is how
+/// `duckctl` knows the two peripherals it sees are one robot and which to connect through.
+///
+/// Only while connectable: a busy robot takes no connection through either, and the broadcast says
+/// everything a listing needs. A twin BlueZ refuses is logged and not propagated — the legacy one is
+/// a robot most centrals can still reach, which is the alias's reasoning again.
+async fn advertise(adapter: &bluer::Adapter, advertised: &Advertised) -> bluer::Result<OnAir> {
     let name = advertised.name.as_str();
     if adapter.alias().await.ok().as_deref() != Some(name)
         && let Err(e) = adapter.set_alias(name.to_owned()).await
@@ -792,7 +813,7 @@ async fn advertise(
         tracing::warn!(error = %e, name, "cannot set the adapter alias; the GAP name stays stale");
     }
 
-    let advertisement = |address: Option<Vec<u8>>| Advertisement {
+    let advertisement = |address: Option<Vec<u8>>, secondary_channel| Advertisement {
         service_uuids: [SERVICE_UUID].into_iter().collect(),
         manufacturer_data: address
             .map(|data| [(duck_ble::adv::COMPANY_ID, data)].into_iter().collect())
@@ -810,21 +831,52 @@ async fn advertise(
         local_name: Some(name.to_owned()),
         min_interval: Some(ADV_INTERVAL_MIN),
         max_interval: Some(ADV_INTERVAL_MAX),
+        secondary_channel,
         ..Default::default()
     };
 
-    let with_address = advertisement(Some(duck_ble::adv::address_data(advertised.address)));
-    match adapter.advertise(with_address).await {
-        Ok(handle) => Ok(handle),
+    let with_address = advertisement(Some(duck_ble::adv::address_data(advertised.address)), None);
+    let legacy = match adapter.advertise(with_address).await {
+        Ok(handle) => handle,
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 "BlueZ refused the advertisement carrying the address; retrying without it, so \
                  `duckctl scan` will show this robot with no address at all"
             );
-            adapter.advertise(advertisement(None)).await
+            adapter.advertise(advertisement(None, None)).await?
         }
-    }
+    };
+
+    let extended = if advertised.connectable {
+        let twin = advertisement(
+            Some(duck_ble::adv::extended_address_data(advertised.address)),
+            Some(SecondaryChannel::OneM),
+        );
+        match adapter.advertise(twin).await {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "BlueZ refused the extended advertisement; a Linux laptop will see this robot \
+                     and fail to connect"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    Ok(OnAir { legacy, extended })
+}
+
+/// What [`advertise`] put on the air. Both deregister on drop.
+struct OnAir {
+    // Never read: held for the drop.
+    #[allow(dead_code)]
+    legacy: AdvertisementHandle,
+    #[allow(dead_code)]
+    extended: Option<AdvertisementHandle>,
 }
 
 /// Keep the advertisement in step with the robot — the name and address `configd` reports, and
@@ -846,7 +898,7 @@ async fn reconcile_advertisement(
     sockets: &Sockets,
     mut advertised: Advertised,
     pinned_name: bool,
-    mut handle: Option<bluer::adv::AdvertisementHandle>,
+    mut handle: Option<OnAir>,
     session: &SessionSlot,
 ) {
     let mut asked = tokio::time::Instant::now();

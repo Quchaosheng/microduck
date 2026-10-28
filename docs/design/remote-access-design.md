@@ -236,6 +236,12 @@ doing before a duck goes home with anybody, because the failure mode is asymmetr
 has been able to write all along cannot be un-done, while a robot that needs a wider scope later
 just asks for one.
 
+**One feature now uses the write scope: sharing the vet book** (`vetbook.share`,
+`updater/src/vetbook.rs`) creates and commits to a public dataset on the owner's account. Narrowing
+the client to `openid profile read-repos` would end that; the alternative already weighed is the
+robot proving its owner to the `microduck-vetbook` Space, and the Space holding the books in a
+Pollen-owned dataset instead of the owner's.
+
 ### 2.5 Where the token lives, and who writes it
 
 `/etc/robot/hf-token`, `root:robot`, `0640`. JSON: the access token, the refresh token, an
@@ -505,6 +511,13 @@ One inherited rule: nothing in a GStreamer signal handler may panic (`pipeline.r
 process abort that taught it). The relay never touches one — but it will want to *reach* the pipeline
 eventually, and that is the boundary to keep clean.
 
+**What it is doing is published, not only logged.** Each state — signed out, connecting, registered,
+refused, retrying — lands in `/run/mediad/remote.json` (`RemoteStatus` in `duck-ipc-proto`), and a
+registration also records the account the service resolved the token to and every accepted heartbeat.
+`robotctl health` prints it as its `central` line, next to the account `updaterd` has on disk. A robot
+is most often "not in the list" because it is listed under somebody else's account, and that line is
+where the two names meet.
+
 ### 3.6 What a bridged peer may call: exactly what a LAN peer may
 
 The session is the same `webrtcsink` session and `route.rs` is the same table. This is deliberate and
@@ -555,6 +568,36 @@ cloned, so there is no path by which a credential is copied onto a second board.
   supersedes the robot's own peer and takes it off the listing. A Space consuming a duck needs its
   own token on the same account, or the visitor's. §5's client uses the visitor's, which is why it
   never meets this.
+
+### 3.8 A control lane that needs no candidate pair
+
+The bridge carries a *negotiation*, and the `control` datachannel is SCTP over whatever pair ICE
+settles on. A relay that is metered out or briefly not answering therefore takes a JSON-RPC call
+of a few hundred bytes down with the video.
+
+The rendezvous already carries what a call needs. `handle_peer_message` in their `app.py` relays
+**every key of a `peer` envelope except `type` and `sessionId`** to the session partner verbatim.
+So a `peer` envelope with an `rpc` key is a control call, relayed opaquely, with no change to a
+service the mini fleet also depends on:
+
+```
+  consumer ──POST /send {type:peer, sessionId, rpc:{…}}──► rendezvous ──SSE──► relay
+           ◄─────────── SSE {type:peer, sessionId, rpc:{…}} ◄──POST /send───────┘
+```
+
+`mediad::relay` answers it with `session::run`: the same routing table, the same per-lane sockets,
+and what a bridged peer may call is §3.6's answer unchanged. `spaces/shared/wire.py` is the client
+half. This is the path for a **program** that drives a duck: it works from a data centre, it is
+authenticated by the account at both ends (§7), and it needs nothing but HTTP.
+
+Two limits, both from the service rather than from us:
+
+- **No pixels.** Video over this would be base64 inside JSON at the rate below. Frames come from
+  WebRTC, or from `media.stream` (§5.3).
+- **Not a teleop lane.** The rendezvous allows 1200 requests per 60 s per peer, and going over
+  earns a `429` on the whole peer — the robot's own lease included. So the robot budgets its
+  notifications on this lane (`relay::Budget`), and a client calls at the rate of a behaviour
+  rather than of a joystick.
 
 ## 4. The rendezvous is the one `reachy_mini` uses — **decided**
 

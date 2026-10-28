@@ -2,7 +2,7 @@
 # Provision a board from your own machine, in one command.
 #
 #   export DUCK_TOKEN=...              # only while the repository is private
-#   ./scripts/provision-board.sh radxa@192.168.1.42
+#   ./scripts/provision-board.sh microduck@192.168.1.42
 #
 # The target is `[user@]host`, and the host can be a name or an address. An address is the
 # normal case on this hardware: mDNS on the Radxa image is unreliable, so `radxa-zero3.local`
@@ -22,6 +22,10 @@
 #                     if that build cannot be installed or is rolled back — a dev board quietly
 #                     running stable when a branch was asked for is worse than a clear stop.
 #                     Needs the branch build to exist, so give CI its minute or two first.
+#   --board BOARD     which electronic board this is: `zero3` (the default, the Radxa Zero 3W)
+#                     or `beta` (the custom board). Written to robotd.toml's `[board] version`,
+#                     which decides the releases the robot can install. The bring-up itself
+#                     (setup-board.sh) is still the Zero 3W's on either.
 #   --name NAME       name the robot, at the end of provisioning: `--name Ducky`. Optional —
 #                     without it the board names itself `duck-<four hex>` from its SoC serial,
 #                     which is already unique per board. Changeable later at any time with
@@ -113,6 +117,7 @@ NO_DEV_KEY=""
 USE_LOCAL=""
 NO_BLE=""
 WEIRD_BLE=""
+BOARD=""
 NO_GSTREAMER=""
 NO_RKAIQ=""
 PAUSE_BTD=""
@@ -160,6 +165,8 @@ BOOT_TIMEOUT=300
 # copied to a laptop and run from anywhere — there is nothing to source.
 STATE=/var/lib/robot/provision.env
 LOG=/var/lib/robot/provision.log
+# How the run this starts ended, when it ended without a reboot. See `OUTCOME` in provision.sh.
+OUTCOME=/var/lib/robot/provision.outcome
 
 # The unit that runs phase 2 on the board, asked whether it failed. Must match `UNIT_NAME` in
 # provision.sh; a mismatch would make a failed phase 2 look like one still working, which is the
@@ -185,6 +192,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --ref)        REF="${2:?--ref needs a branch}"; shift 2 ;;
         --name)       ROBOT_NAME="${2:?--name needs a name}"; shift 2 ;;
+        --board)      BOARD="${2:?--board needs a board}"; shift 2 ;;
         --forget-host-key) FORGET_KEY=1; shift ;;
         --dev-key)    DEV_KEY="${2:?--dev-key needs a path}"; shift 2 ;;
         --no-dev-key) NO_DEV_KEY=1; shift ;;
@@ -201,6 +209,13 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$HOST" ] || usage 2
+
+# The names are `robotd_params::board::BOARD_LABELS`; install.sh checks again on the board.
+case "$BOARD" in
+    ""|zero3) ;;
+    beta) warn "--board beta declares the board; setup-board.sh still brings up a Zero 3W" ;;
+    *) die "--board ${BOARD}: zero3 or beta" ;;
+esac
 
 command -v ssh >/dev/null 2>&1 || die "ssh is required"
 command -v scp >/dev/null 2>&1 || die "scp is required"
@@ -278,6 +293,14 @@ alive() (
     wait "$_probe_pid"
 ) 2>/dev/null
 
+# The health report is the point of all of it, and it is also the thing most likely to have
+# something to say — a bench board with no servos powered reports unhealthy, correctly.
+report_health() {
+    rsh "robotctl health" || warn "robotctl health did not report cleanly. On a board with no
+  servos powered that is the honest answer, not a failed install. The full log is at:
+    ssh -t ${HOST} 'sudo cat ${LOG}'"
+}
+
 # Does the board still have provisioning left to do? `provision.sh` removes the state file when it
 # finishes, which makes "are we done" a question with a file for an answer rather than a log line
 # to pattern-match.
@@ -291,8 +314,24 @@ alive() (
 # had merely moved to a new lease mid-install — and the watcher announced provisioning complete and
 # then a health check that could not connect. Which of the two it is decides whether to stop or to
 # go looking, so it cannot be collapsed.
+#
+# **Only `test`'s own 1 means the file is gone.** ssh exits 255 when *it* fails, and it fails for
+# one round-trip at a time on a board busy unpacking packages: a 5 s connect timeout and a 6 s
+# keepalive budget are both reachable while apt runs triggers on 1 GB of memory. Reading any
+# non-zero as "absent" let one slow answer, followed by a successful `alive`, announce provisioning
+# finished mid-apt — and then run `robotctl health` on a board that did not have robotctl yet.
 still_provisioning() {
-    if rsh "test -f ${STATE}" >/dev/null 2>&1; then
+    _state=0
+    rsh "test -f ${STATE}" >/dev/null 2>&1 || _state=$?
+    if [ "$_state" != 0 ] && [ "$_state" != 1 ]; then
+        # No answer about the file at all. Ask again next time round if the board is there;
+        # otherwise it is the lost board the verdict 2 exists for.
+        if alive 10; then
+            return 0
+        fi
+        return 2
+    fi
+    if [ "$_state" = 0 ]; then
         # The state file outlives a phase 2 that *failed*: `provision.sh` removes it only on the way
         # out cleanly, so its presence alone cannot tell a board still working from one that stopped
         # with an error. Ask systemd, which knows.
@@ -691,10 +730,15 @@ fi
 say "starting provisioning — the board will reboot and this will wait for it"
 echo
 
-_env="DUCK_TOKEN='${DUCK_TOKEN:-}'"
+# Names this run, so the outcome provision.sh records is known to be this run's and not one left
+# behind by an earlier attempt.
+RUN_ID="$(date +%s).$$"
+
+_env="DUCK_TOKEN='${DUCK_TOKEN:-}' DUCK_RUN_ID=${RUN_ID}"
 [ -z "$REF" ]     || _env="${_env} DUCK_REF='${REF}'"
 [ -z "$DEV_KEY" ] || _env="${_env} DUCK_DEV_KEY=/tmp/team.dev.pub"
 [ -z "$WEIRD_BLE" ] || _env="${_env} DUCK_WEIRD_BLE=1"
+[ -z "$BOARD" ]     || _env="${_env} DUCK_BOARD=${BOARD}"
 [ -z "$PAUSE_BTD" ]  || _env="${_env} DUCK_PAUSE_BTD=1"
 [ -z "$NO_GSTREAMER" ] || _env="${_env} DUCK_GSTREAMER=0"
 [ -z "$NO_RKAIQ" ]     || _env="${_env} DUCK_RKAIQ=0"
@@ -713,6 +757,28 @@ fi
 # is the *expected* outcome. Whether it worked is decided below, by looking at the board.
 ssh -t -o StrictHostKeyChecking=accept-new "$HOST" \
     "sudo env ${_env} sh /tmp/provision.sh${_args}" || true
+
+# Not every run reboots. On a board whose phase 1 already ran — a re-run after a failure, whose
+# state file is still there — provision.sh does phase 2 in the session above, and stops in it if
+# anything fails. Waiting for a reboot and then streaming the board's log would replay the
+# *previous* attempt as this one's result, which is what kept showing a fixed failure as current
+# (2026-10-17). So ask how this run ended first; only a reboot, or no answer, goes on to watch.
+# A board still answering mid-reboot reads `rebooting`, and one already gone reads nothing.
+_outcome="$(rsh "cat ${OUTCOME} 2>/dev/null" 2>/dev/null || true)"
+case "$_outcome" in
+    "${RUN_ID} done")
+        echo
+        say "phase 1 had already run on ${HOST_ONLY}, so phase 2 ran in the session above"
+        report_health
+        exit 0
+        ;;
+    "${RUN_ID} ended "*)
+        echo
+        die "provisioning stopped on ${HOST_ONLY} (exit ${_outcome##* }) without rebooting; the
+  reason is just above, in the session's own output. Nothing is left running on the board, so fix
+  that and re-run this same command — it carries on from where the board is."
+        ;;
+esac
 
 echo
 say "waiting for ${HOST} to come back (up to ${BOOT_TIMEOUT}s)"
@@ -886,9 +952,4 @@ done
 
 echo
 say "provisioning finished"
-
-# The health report is the point of all of it, and it is also the thing most likely to have
-# something to say — a bench board with no servos powered reports unhealthy, correctly.
-rsh "robotctl health" || warn "robotctl health did not report cleanly. On a board with no
-  servos powered that is the honest answer, not a failed install. The full log is at:
-    ssh -t ${HOST} 'sudo cat ${LOG}'"
+report_health

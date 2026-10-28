@@ -85,10 +85,6 @@ enum Command {
         #[arg(long)]
         revision: Option<String>,
 
-        /// Minimum hardware revision this release supports.
-        #[arg(long, default_value_t = 0)]
-        min_hw_rev: u32,
-
         /// Force robots below this version to upgrade without waiting for a client
         /// (§8.1). Set this only when remediating a bad release.
         #[arg(long)]
@@ -220,7 +216,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             out,
             base_url,
             revision,
-            min_hw_rev,
             min_supported,
             includes,
             allow_version_drift,
@@ -232,7 +227,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             out,
             base_url,
             revision,
-            min_hw_rev,
             min_supported,
             includes,
             allow_version_drift,
@@ -277,7 +271,6 @@ struct PackageArgs {
     out: PathBuf,
     base_url: Option<String>,
     revision: Option<String>,
-    min_hw_rev: u32,
     min_supported: Option<semver::Version>,
     includes: Vec<String>,
     allow_version_drift: bool,
@@ -411,6 +404,15 @@ fn package(args: PackageArgs) -> Result<(), Box<dyn std::error::Error>> {
         None => artifact_name.clone(),
     };
 
+    // Not a flag: the boards a release supports are `Board::last_release`, in the source being
+    // packaged, so retiring one is a commit and nobody has to remember an argument in CI.
+    let min_hw_rev = robotd_params::board::min_hw_rev(&args.version).ok_or_else(|| {
+        format!(
+            "{} is past every board's last release (robotd_params::board::Board::last_release)",
+            args.version
+        )
+    })?;
+
     let mut manifest = serde_json::json!({
         "channel": args.channel,
         "version": args.version,
@@ -418,7 +420,7 @@ fn package(args: PackageArgs) -> Result<(), Box<dyn std::error::Error>> {
         "sha256": digest,
         "sig_url": format!("{url}{SIG_SUFFIX}"),
         "size": bytes.len(),
-        "min_hw_rev": args.min_hw_rev,
+        "min_hw_rev": min_hw_rev,
         "schema_version": 1,
     });
     if let Some(revision) = &args.revision {
@@ -1835,6 +1837,34 @@ mod tests {
         }
     }
 
+    /// The pick-up classifier ships inside the release like the petting one, for the same
+    /// reasons: small, a detector rather than a policy, versioned with the loop that feeds it —
+    /// its input is the loop's own feature layout, so a model from another release is the wrong
+    /// shape in the way no load check can see. A site that forgets it produces robots on which
+    /// `[pickup] enabled = true` logs "unavailable" once and the duck thrashes in the hand as
+    /// before.
+    #[test]
+    fn the_pickup_model_is_packaged_at_every_site() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask/ has a parent");
+        assert!(
+            root.join("duck-control/models/pickup_detector.onnx")
+                .exists(),
+            "the vendored model is gone"
+        );
+        for site in PACKAGING_SITES {
+            let text =
+                std::fs::read_to_string(root.join(site)).unwrap_or_else(|e| panic!("{site}: {e}"));
+            assert!(
+                text.contains(
+                    "duck-control/models/pickup_detector.onnx=models/pickup_detector.onnx"
+                ),
+                "{site} does not package the pick-up classifier"
+            );
+        }
+    }
+
     /// The duck detector left the release the way the policies did: it is seeded from the Hub
     /// by a script the release carries, and the model files themselves are no longer vendored.
     /// A site that still packages `models/duck_detect.*` would ship fourteen megabytes nothing
@@ -1981,6 +2011,48 @@ mod tests {
                      --include \"hooks/{name}=hooks/{name}\""
                 );
             }
+        }
+    }
+
+    /// Guard every shipped binary, including tools that no systemd unit execs.
+    #[test]
+    fn daemon_required_files_match_packaged_binaries() {
+        use std::collections::BTreeSet;
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let config: toml::Value =
+            toml::from_str(&std::fs::read_to_string(root.join("deploy/updater.toml")).unwrap())
+                .unwrap();
+        let required: BTreeSet<String> = config["component"]["daemon"]
+            .get("required_files")
+            .and_then(toml::Value::as_array)
+            .expect("the shipped daemon config must enable required_files")
+            .iter()
+            .map(|value| value.as_str().unwrap().to_owned())
+            .collect();
+        for site in PACKAGING_SITES {
+            let text = std::fs::read_to_string(root.join(site)).unwrap();
+            let packaged: BTreeSet<String> = text
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("cp ") && line.ends_with(" staged/"))
+                .map(|line| {
+                    format!(
+                        "bin/{}",
+                        line.trim_end_matches(" staged/")
+                            .rsplit('/')
+                            .next()
+                            .unwrap()
+                    )
+                })
+                .collect();
+            assert!(!packaged.is_empty(), "{site}: no staged binaries found");
+            assert_eq!(
+                required, packaged,
+                "required_files must match the binaries packaged by {site}"
+            );
         }
     }
 

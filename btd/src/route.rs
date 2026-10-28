@@ -270,14 +270,22 @@ fn permits(call: &proto::Call) -> bool {
         // assuming a list; an unknown name is refused with the names it does know.
         RobotDo(_) => true,
 
-        // Harmless and rather charming from a phone — but it rides the same refusal as the
-        // rest of robot.* until the app path exists to want it: opening one call to the
-        // radio ahead of a client that can use it buys nothing and widens the surface.
+        // **A quack is how you tell ducks apart**, and that is a question asked from the room:
+        // every voice is seeded from the SoC serial, so the robot that answers in its own voice
+        // is the one this link reached. `duckctl quack` is the client that wanted it — the
+        // radio's version of `robotctl quack`. One request, not a stream, and it moves nothing.
+        RobotSound(_) => true,
+
+        // Harmless and rather charming from a phone — but they ride the same refusal as the
+        // rest of robot.* until the app path exists to want them: opening a call to the radio
+        // ahead of a client that can use it buys nothing and widens the surface.
         //
         // The theremin sits here rather than with motor control even though it moves the
         // mouth, because what it is is a sound: the mouth is following the note. Same
         // refusal either way, and the same reason to lift it — an app that can play the duck.
-        RobotSound(_) | RobotTheremin(_) | RobotChorale(_) => false,
+        RobotTheremin(_) | RobotChorale(_) => false,
+        // The flashlight waits for the same app: an LED is no more urgent from a phone than a quack.
+        RobotFlashlight(_) => false,
 
         // The chorale's own namespace is between `btd` and `robotd` — it is how this daemon is told
         // what to advertise and how it reports what it heard. Not a client surface at all, so a
@@ -351,6 +359,11 @@ fn permits(call: &proto::Call) -> bool {
         // Static geometry, read-only; the same class of read as the one above.
         RobotModel => true,
 
+        // The vet book: the robot's lifetime record, read once when somebody opens the page — the
+        // app is its obvious reader. A note is a dated line of text from a PIN-bonded phone in the
+        // room; it moves nothing and cannot push a servo's history out of the book.
+        RobotVetbook | RobotVetbookNote(_) => true,
+
         // Re-reading the slots after something else edited the config. Same blast radius as
         // `robot.loadPolicy` and the same answer, and a client that can load wants this for the
         // case where the file changed underneath it.
@@ -405,6 +418,13 @@ fn permits(call: &proto::Call) -> bool {
         // non-event rather than a lost login.
         AccountLogin(_) | AccountStatus | AccountLogout => true,
 
+        // Sharing the vet book is the phone's job more than anyone's: the share sheet that posts
+        // the card is on the phone. PIN-bonded and in the room, like the login it depends on, and
+        // the reply is a link and a dataset name — a few hundred bytes.
+        VetbookShare(_) => true,
+        // Daemon-to-daemon: how `mediad` and `tofd` report to the book. Nothing a phone sends.
+        RobotVetbookTally(_) => false,
+
         // **Standing the robot up, which is how anything else here starts.**
         //
         // Refused until the phone app was used, on the grounds that standing a robot up moves
@@ -447,6 +467,11 @@ fn permits(call: &proto::Call) -> bool {
         // same claim `robot.do` and `robot.loadPolicy` are routed on — ten metres of radio range
         // means whoever tapped it is looking at the robot.
         RobotRebootMotors(_) => true,
+
+        // A rest ends where a servo reboot does — limp — and gets there more gently: sat down
+        // and eased into the rest pose first when the robot is driving. Permitted on
+        // `rebootMotors`' argument; it is `relax`'s unannounced drop it avoids, not its outcome.
+        RobotRest => true,
 
         // **`relax` stays refused, and the asymmetry is the point.** Standing up is controlled:
         // the joints go where they are told. Relaxing is a robot that was holding itself up and
@@ -713,6 +738,17 @@ mod tests {
         for (call, want) in expected {
             assert_eq!(upstream_for(&call), Some(want), "{}", call.method());
         }
+    }
+
+    /// **A quack crosses the radio.** `duckctl quack` answers "which duck is this link talking
+    /// to", and a refusal here would make it a command that never sounds.
+    #[test]
+    fn a_quack_reaches_robotd() {
+        let quack = proto::Call::RobotSound(proto::SoundParams {
+            tag: proto::SoundTag::Chirp,
+            hold: None,
+        });
+        assert_eq!(upstream_for(&quack), Some(Upstream::Robot));
     }
 
     /// **A phone can ask for a skill, see what the robot has, and change what it runs.**

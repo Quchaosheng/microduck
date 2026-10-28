@@ -90,21 +90,9 @@ const POLL_GUARD: Duration = Duration::from_millis(20);
 const RETRY_MIN: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(60);
 
-/// Buses to try when none was named, in order.
-///
-/// `/dev/i2c-pihat` is the udev symlink `setup-board.sh` installs, which follows
-/// the HAT bus; `/dev/i2c-3` is what the `i2c3-pihat` overlay creates and is the
-/// answer on a board provisioned before that rule existed. Trying both means a
-/// board that predates the rule still finds its sensor, and the log says which
-/// path answered.
-pub(crate) const BUS_CANDIDATES: [&str; 2] = ["/dev/i2c-pihat", "/dev/i2c-3"];
-
-/// Addresses to try when none was named.
-///
-/// 0x29 is the factory default for both generations. 0x52 is where the prototype
-/// moved a VL53L5CX when an I²C IMU wanted 0x29 — that IMU is gone, but a sensor
-/// programmed then is still at 0x52, and the address survives power cycles.
-const ADDRESS_CANDIDATES: [u8; 2] = [0x29, 0x52];
+// EMFILE remains immediately ready until a descriptor is freed. Retrying without a pause fills
+// the journal and consumes a core instead of letting disconnected subscribers release their FDs.
+const ACCEPT_RETRY: Duration = Duration::from_secs(1);
 
 #[derive(Parser, Debug)]
 #[command(name = "tofd", about = "Head ToF sensor daemon", version)]
@@ -113,13 +101,19 @@ struct Args {
     #[arg(long, default_value = proto::socket::TOF)]
     socket: PathBuf,
 
-    /// I²C bus device. Unset tries the HAT symlink, then the i2c3 bus.
+    /// I²C bus device, which forces I²C whatever the board. Unset, a board on I²C tries the HAT
+    /// symlink, then the i2c3 bus.
     #[arg(long)]
     bus: Option<PathBuf>,
 
-    /// 7-bit I²C address. Unset tries 0x29, then 0x52.
+    /// 7-bit I²C address, which forces I²C whatever the board. Unset tries 0x29, then 0x52.
     #[arg(long, value_parser = parse_address)]
     address: Option<u8>,
+
+    /// A spidev to find a VL53L8CX on, whatever the board. Unset, the board decides: the beta's
+    /// ToF is on SPI (`tof::link`), a Zero 3W's on I²C.
+    #[arg(long, conflicts_with_all = ["bus", "address"])]
+    spi: Option<PathBuf>,
 
     /// Ranging rate, Hz. 15 is what an 8×8 frame costs about 5% of a 400 kHz bus
     /// to deliver; the sensor accepts up to 15 at this resolution.
@@ -200,15 +194,25 @@ async fn main() -> std::process::ExitCode {
 
     let status = Arc::new(Status::new(args.hz));
     let (frames, _) = tokio::sync::broadcast::channel(FRAME_BUFFER);
+    tokio::spawn(vetbook_tally(frames.subscribe()));
+
+    // `robotd`'s file, read once: the board decides which bus the sensor is on, and
+    // `[head_imu]` whether the IMU is read.
+    let config_path = args.config.clone().unwrap_or_else(config::default_path);
+    let params = config::load(&config_path, args.config.is_some());
+    let links = tof::link::candidates(
+        params.board.version,
+        args.spi.as_deref(),
+        args.bus.as_deref(),
+        args.address,
+    );
 
     // The sensor runs on a plain thread, not a tokio task: every call into the
-    // driver blocks on I²C — the firmware upload for seconds — and none of it is
+    // driver blocks on the bus — the firmware upload for seconds — and none of it is
     // cancellation-safe. `shutdown` lets it out of its loops at exit.
     let shutdown = Arc::new(AtomicBool::new(false));
     let sensor_thread = {
         let (status, frames, shutdown) = (status.clone(), frames.clone(), shutdown.clone());
-        let bus = args.bus.clone();
-        let address = args.address;
         let hz = args.hz;
         let fake = args.fake;
         let sim = args.sim.clone();
@@ -220,7 +224,7 @@ async fn main() -> std::process::ExitCode {
                 } else if fake {
                     fake_loop(hz, &status, &frames, &shutdown);
                 } else {
-                    sensor_loop(bus.as_deref(), address, hz, &status, &frames, &shutdown);
+                    sensor_loop(&links, hz, &status, &frames, &shutdown);
                 }
             })
             .expect("spawn the sensor thread")
@@ -239,12 +243,22 @@ async fn main() -> std::process::ExitCode {
     // Skipped for --sim/--fake too: there is no real bus behind either.
     let imu_status = Arc::new(ImuStatus::new(args.imu_hz));
     let (imu_frames, _) = tokio::sync::broadcast::channel(imu::FRAME_BUFFER);
-    let config_path = args.config.clone().unwrap_or_else(config::default_path);
-    let configured = config::load(&config_path, args.config.is_some())
-        .head_imu
-        .enabled;
-    let wanted = args.imu || (configured && !args.no_imu);
-    let imu_thread = if !wanted || args.fake || args.sim.is_some() {
+    // The beta's head IMU is a different chip on a different bus, and `robotd` reads it
+    // (robotd/src/head_imu.rs). There is nothing of tofd's on that board to read, so a
+    // subscriber here is pointed at the daemon that does serve it — even under `--imu`, which
+    // would only sweep the buses for a BMI088 that is not fitted.
+    let board = params.board.version;
+    let served_elsewhere = board != robotd_params::board::Board::Zero3;
+    let configured = params.head_imu.enabled_on(board);
+    let wanted = !served_elsewhere && (args.imu || (configured && !args.no_imu));
+    let imu_thread = if served_elsewhere {
+        tracing::info!(
+            board = board.label(),
+            "the head IMU on this board is robotd's"
+        );
+        imu_status.elsewhere(robotd_params::HeadImuParams::reader(board));
+        None
+    } else if !wanted || args.fake || args.sim.is_some() {
         // Said out loud, and said by the stream too: a subscriber gets this sentence instead of
         // frames, because "no samples" and "no BMI088 fitted" are different answers and only one
         // of them is somebody's mistake.
@@ -299,8 +313,7 @@ fn quiet_period(hz: u8) -> Duration {
 /// Bring the sensor up and stream from it, forever, with a backoff between
 /// attempts. Never returns until shutdown.
 fn sensor_loop(
-    bus: Option<&Path>,
-    address: Option<u8>,
+    links: &[tof::Link],
     hz: u8,
     status: &Arc<Status>,
     frames: &tokio::sync::broadcast::Sender<proto::TofFrame>,
@@ -313,7 +326,7 @@ fn sensor_loop(
     let quiet = quiet_period(hz);
 
     while !shutdown.load(Ordering::Acquire) {
-        match open_sensor(bus, address, hz) {
+        match open_sensor(links, hz) {
             Ok(mut sensor) => {
                 backoff = RETRY_MIN;
                 said = false;
@@ -553,35 +566,27 @@ struct SimDepth {
     status: Vec<u8>,
 }
 
-/// Try the named bus and address, or every candidate, and return the first
-/// sensor that comes up ranging.
-fn open_sensor(bus: Option<&Path>, address: Option<u8>, hz: u8) -> Result<tof::Sensor> {
-    let buses: Vec<PathBuf> = match bus {
-        Some(bus) => vec![bus.to_path_buf()],
-        None => BUS_CANDIDATES.iter().map(PathBuf::from).collect(),
-    };
-    let addresses: Vec<u8> = match address {
-        Some(address) => vec![address],
-        None => ADDRESS_CANDIDATES.to_vec(),
-    };
-
+/// Try each place the sensor could be, and return the first one that comes up
+/// ranging.
+fn open_sensor(links: &[tof::Link], hz: u8) -> Result<tof::Sensor> {
     let mut last = None;
-    for bus in &buses {
-        // A missing bus is not worth an address sweep, and saying so is more use
-        // than "nothing answered": it means the overlay is not loaded.
-        if !bus.exists() {
-            last = Some(anyhow::anyhow!("{} does not exist", bus.display()));
+    for link in links {
+        // A missing device is not worth trying, and saying so is more use than
+        // "nothing answered": it means the overlay or the spidev is not there.
+        if !link.device().exists() {
+            last = Some(anyhow::anyhow!(
+                "{} does not exist",
+                link.device().display()
+            ));
             continue;
         }
-        for &address in &addresses {
-            match tof::Sensor::open(bus, address) {
-                Ok(mut sensor) => {
-                    tracing::info!(bus = %bus.display(), address = format!("{address:#04x}"), "sensor found");
-                    sensor.start(hz)?;
-                    return Ok(sensor);
-                }
-                Err(e) => last = Some(e),
+        match tof::Sensor::open(link) {
+            Ok(mut sensor) => {
+                tracing::info!(%link, "sensor found");
+                sensor.start(hz)?;
+                return Ok(sensor);
             }
+            Err(e) => last = Some(e),
         }
     }
     Err(last.unwrap_or_else(|| anyhow::anyhow!("no bus to look on")))
@@ -639,10 +644,14 @@ async fn serve(
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut accept_after = tokio::time::Instant::now();
 
     loop {
         tokio::select! {
-            accepted = listener.accept() => match accepted {
+            accepted = async {
+                tokio::time::sleep_until(accept_after).await;
+                listener.accept().await
+            } => match accepted {
                 Ok((stream, _)) => {
                     let status = status.clone();
                     let imu_status = imu_status.clone();
@@ -654,7 +663,10 @@ async fn serve(
                         }
                     });
                 }
-                Err(e) => tracing::warn!(error = %e, "accept failed"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "accept failed; retrying in one second");
+                    accept_after = tokio::time::Instant::now() + ACCEPT_RETRY;
+                }
             },
             _ = term.recv() => {
                 tracing::warn!("SIGTERM; stopping");
@@ -709,13 +721,19 @@ async fn subscriber(
                 let response = proto::Response::ok(id, &status.result());
                 write_line(&mut write, &response).await?;
                 let mut frames = frames.subscribe();
-                return stream_tof(&mut write, &mut frames).await;
+                return tokio::select! {
+                    result = stream_tof(&mut write, &mut frames) => result,
+                    result = client_disconnected(&mut reader) => result,
+                };
             }
             Ok(proto::Call::HeadImuStream) => {
                 let response = proto::Response::ok(id, &imu_status.result());
                 write_line(&mut write, &response).await?;
                 let mut imu_frames = imu_frames.subscribe();
-                return stream_imu(&mut write, &mut imu_frames).await;
+                return tokio::select! {
+                    result = stream_imu(&mut write, &mut imu_frames) => result,
+                    result = client_disconnected(&mut reader) => result,
+                };
             }
             _ => {
                 let response = proto::Response::err(
@@ -729,6 +747,16 @@ async fn subscriber(
             }
         }
     }
+}
+
+/// A missing or disabled sensor never wakes the frame channel, so a failed write cannot reveal
+/// that the viewer went away. Watch the read half too, and discard further input: subscriptions
+/// carry one request followed only by server notifications.
+async fn client_disconnected(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+) -> Result<()> {
+    tokio::io::copy(reader, &mut tokio::io::sink()).await?;
+    Ok(())
 }
 
 /// Stream ToF frames as notifications until the socket closes or the consumer lags out. A lag is
@@ -890,9 +918,68 @@ mod tests {
             "a client that asked for depth must not hold an imu receiver"
         );
 
-        // `stream_tof` is parked on the channel, not on the socket, so it would sit there until a
-        // frame arrived. Nothing here sends one, and the counts have already been taken.
-        served.abort();
+        drop(reader);
+        drop(write);
+        tokio::time::timeout(Duration::from_secs(1), served)
+            .await
+            .expect("a disconnected subscriber must not wait for a sensor frame")
+            .unwrap();
+        assert_eq!(frames.receiver_count(), 0);
+        assert_eq!(imu_frames.receiver_count(), 0);
+    }
+
+    /// An absent or disabled sensor produces no frames. A viewer that retries its subscription
+    /// must not leave a socket and task behind on each reconnect; otherwise the daemon exhausts
+    /// its file descriptors and turns every accept into a warning.
+    #[tokio::test]
+    async fn reconnecting_without_sensor_frames_releases_each_subscriber() {
+        let (frames, _) = tokio::sync::broadcast::channel::<proto::TofFrame>(4);
+        let (imu_frames, _) = tokio::sync::broadcast::channel::<proto::HeadImuFrame>(4);
+        let status = Arc::new(Status::new(15));
+        status.down("no ToF sensor fitted");
+        let imu_status = Arc::new(ImuStatus::new(25));
+        imu_status.off();
+
+        for call in [proto::Call::TofStream, proto::Call::HeadImuStream] {
+            for _ in 0..32 {
+                let (client, server) = UnixStream::pair().unwrap();
+                let served = {
+                    let (status, imu_status, frames, imu_frames) = (
+                        status.clone(),
+                        imu_status.clone(),
+                        frames.clone(),
+                        imu_frames.clone(),
+                    );
+                    tokio::spawn(async move {
+                        subscriber(server, &status, &frames, &imu_status, &imu_frames).await
+                    })
+                };
+                let (read, mut write) = client.into_split();
+                let mut reader = BufReader::new(read);
+                write_line(
+                    &mut write,
+                    &proto::Request::call(proto::Id::Number(1), &call),
+                )
+                .await
+                .unwrap();
+                let mut answer = String::new();
+                reader.read_line(&mut answer).await.unwrap();
+                let response: serde_json::Value = serde_json::from_str(&answer).unwrap();
+                assert_eq!(response["result"]["accepted"], true, "{answer}");
+                assert!(response["result"]["sensor"].is_null(), "{answer}");
+                assert!(!served.is_finished(), "a live client still owns its stream");
+
+                drop(reader);
+                drop(write);
+                tokio::time::timeout(Duration::from_secs(1), served)
+                    .await
+                    .expect("disconnect must release a stream even when no frames arrive")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(frames.receiver_count(), 0, "depth receiver leaked");
+                assert_eq!(imu_frames.receiver_count(), 0, "IMU receiver leaked");
+            }
+        }
     }
 
     #[test]
@@ -953,5 +1040,162 @@ mod tests {
     #[test]
     fn a_zero_rate_is_treated_as_one_hertz() {
         assert_eq!(quiet_period(0), Duration::from_secs(1) - POLL_GUARD);
+    }
+}
+
+/// How often the vet book hears from this daemon.
+const VETBOOK_EVERY: Duration = Duration::from_secs(60);
+
+/// One zone's side, radians: the sensor's 45° field split eight ways.
+const ZONE_RAD: f64 = (45.0 / 8.0) * std::f64::consts::PI / 180.0;
+
+/// The vet book's depth records, from the frames this daemon already publishes.
+///
+/// A listener on the same broadcast every client reads, so the sensor's loop is untouched and the
+/// cost is one small copy per frame and a few dozen multiply-adds. Nothing here asks for frames: a
+/// duck whose sensor is not streaming reports nothing.
+///
+/// New surface is counted per zone against the distance that zone last counted at — see
+/// `vetbook::key::SURFACE_M2`. A frame the same as the last adds nothing, which is what most frames
+/// of a duck standing still are; it is not a map, so coming back to a wall counts it again.
+async fn vetbook_tally(mut frames: tokio::sync::broadcast::Receiver<proto::TofFrame>) {
+    use proto::vetbook::{VetbookTallyParams, merge_maps};
+    let socket = PathBuf::from(proto::socket::ROBOT);
+    let mut pending = VetbookTallyParams::default();
+    let mut counted = Counted::default();
+    let mut reported = Instant::now();
+    loop {
+        match frames.recv().await {
+            Ok(frame) => tally_frame(frame, &mut counted, &mut pending),
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        }
+        if reported.elapsed() < VETBOOK_EVERY || pending.is_empty() {
+            continue;
+        }
+        reported = Instant::now();
+        let batch = std::mem::take(&mut pending);
+        let socket = socket.clone();
+        let sent = tokio::task::spawn_blocking(move || {
+            proto::vetbook::report(&socket, &batch, Duration::from_secs(2)).map_err(|e| (e, batch))
+        })
+        .await;
+        // `robotd` restarting, or not up yet: keep the counts for the next report.
+        if let Ok(Err((e, batch))) = sent {
+            tracing::debug!(error = %e, "vet book: report not delivered; keeping it");
+            let (t, h, l) = (&mut pending.tallies, &mut pending.highs, &mut pending.lows);
+            merge_maps(t, h, l, &batch);
+        }
+    }
+}
+
+/// The distance each zone last counted new surface at, metres; zero where it never has.
+struct Counted([f64; tof::ZONES]);
+
+impl Default for Counted {
+    fn default() -> Self {
+        Self([0.0; tof::ZONES])
+    }
+}
+
+/// A zone's distance has moved past sensor noise: more than 10 cm, or 15 % of the distance.
+fn moved(was: f64, now: f64) -> bool {
+    was == 0.0 || (now - was).abs() > (0.10f64).max(0.15 * was)
+}
+
+fn tally_frame(
+    frame: proto::TofFrame,
+    counted: &mut Counted,
+    pending: &mut proto::vetbook::VetbookTallyParams,
+) {
+    use proto::vetbook::key;
+    let frame = tof::Frame {
+        rows: frame.rows,
+        cols: frame.cols,
+        distance_mm: frame.distance_mm,
+        status: frame.status,
+    };
+    let (mut area, mut closest, mut farthest) = (0.0f64, f64::INFINITY, 0.0f64);
+    for (i, zone) in frame.zones().enumerate() {
+        if let tof::Zone::Range(metres) = zone {
+            let d = f64::from(metres);
+            if let Some(last) = counted.0.get_mut(i)
+                && moved(*last, d)
+            {
+                area += d * d * ZONE_RAD * ZONE_RAD;
+                *last = d;
+            }
+            // Whole millimetres, the sensor's own resolution; the f32 metres in between add noise.
+            let mm = (d * 1000.0).round();
+            closest = closest.min(mm);
+            farthest = farthest.max(mm);
+        }
+    }
+    *pending
+        .tallies
+        .entry(key::TOF_FRAMES.to_owned())
+        .or_default() += 1.0;
+    if area > 0.0 {
+        *pending
+            .tallies
+            .entry(key::SURFACE_M2.to_owned())
+            .or_default() += area;
+        let low = pending
+            .lows
+            .entry(key::CLOSEST_MM.to_owned())
+            .or_insert(closest);
+        *low = low.min(closest);
+        let high = pending
+            .highs
+            .entry(key::FARTHEST_MM.to_owned())
+            .or_insert(farthest);
+        *high = high.max(farthest);
+    }
+}
+
+#[cfg(test)]
+mod vetbook_tests {
+    use super::*;
+    use proto::vetbook::{VetbookTallyParams, key};
+
+    fn frame(distance_mm: i16) -> proto::TofFrame {
+        proto::TofFrame {
+            rows: 8,
+            cols: 8,
+            distance_mm: vec![distance_mm; tof::ZONES],
+            status: vec![5u8; tof::ZONES],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_frame_adds_its_extremes_and_its_new_surface() {
+        let (mut counted, mut pending) = (Counted::default(), VetbookTallyParams::default());
+        let mut f = frame(1000);
+        f.distance_mm[0] = 120;
+        f.status[1] = 255; // not a range
+        tally_frame(f, &mut counted, &mut pending);
+        assert_eq!(pending.tallies[key::TOF_FRAMES], 1.0);
+        assert_eq!(pending.lows[key::CLOSEST_MM], 120.0);
+        assert_eq!(pending.highs[key::FARTHEST_MM], 1000.0);
+        // 62 zones at 1 m and one at 12 cm, each (45°/8)² sr.
+        let expected = (62.0 + 0.12 * 0.12) * ZONE_RAD * ZONE_RAD;
+        assert!((pending.tallies[key::SURFACE_M2] - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn staring_at_a_wall_adds_no_surface() {
+        let (mut counted, mut pending) = (Counted::default(), VetbookTallyParams::default());
+        tally_frame(frame(2000), &mut counted, &mut pending);
+        let first = pending.tallies[key::SURFACE_M2];
+        // A minute at 15 Hz, with the sensor's own few-centimetre jitter.
+        for i in 0..900 {
+            tally_frame(frame(2000 + (i % 7) * 10 - 30), &mut counted, &mut pending);
+        }
+        assert_eq!(pending.tallies[key::SURFACE_M2], first);
+        assert_eq!(pending.tallies[key::TOF_FRAMES], 901.0);
+        // Turning to a wall half as far away is new surface.
+        tally_frame(frame(1000), &mut counted, &mut pending);
+        assert!(pending.tallies[key::SURFACE_M2] > first);
     }
 }

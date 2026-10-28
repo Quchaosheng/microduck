@@ -29,6 +29,17 @@
 //! field is then evidence in itself: absent means a robot on a release that predates this, present
 //! and zero means a robot that has no address, and those two want different next moves. Dropping
 //! the field would collapse them into one blank column.
+//!
+//! ## The extended twin carries one byte more
+//!
+//! `btd` puts the same payload on the air twice: once as a legacy advertisement and once as an
+//! extended one, because the robot's controller cannot take a connection from a central that offers
+//! channel selection algorithm #2 over a legacy advertisement (`app-path-design.md` §3.8). The two
+//! arrive from different random addresses, so to a scanner they are two peripherals with the same
+//! name — which `duckctl` refuses as a collision unless it can tell they are one robot.
+//!
+//! [`EXTENDED_MARK`] after the address is how it tells. The extended advertisement has no 31-byte
+//! budget, so the byte costs nothing there, and the legacy payload is unchanged.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -41,12 +52,37 @@ use std::net::Ipv4Addr;
 /// already advertised [`crate::gatt::SERVICE_UUID`], which is the discriminator.
 pub const COMPANY_ID: u16 = 0xFFFF;
 
+/// The byte after the address that says "this is the extended twin of a legacy advertisement".
+pub const EXTENDED_MARK: u8 = 0x01;
+
 /// The robot's address as it goes into the advertisement.
 ///
 /// `None` — no wifi, or `configd` would not say — becomes [`Ipv4Addr::UNSPECIFIED`] rather than an
 /// absent field, for the reason in this module's docs.
 pub fn address_data(address: Option<Ipv4Addr>) -> Vec<u8> {
     address.unwrap_or(Ipv4Addr::UNSPECIFIED).octets().to_vec()
+}
+
+/// [`address_data`] followed by [`EXTENDED_MARK`], for the extended advertisement.
+pub fn extended_address_data(address: Option<Ipv4Addr>) -> Vec<u8> {
+    let mut data = address_data(address);
+    data.push(EXTENDED_MARK);
+    data
+}
+
+/// The four address bytes of a field in either layout, or `None` for anything else.
+fn address_bytes(manufacturer_data: &HashMap<u16, Vec<u8>>) -> Option<[u8; 4]> {
+    match manufacturer_data.get(&COMPANY_ID)?.as_slice() {
+        [a, b, c, d] | [a, b, c, d, EXTENDED_MARK] => Some([*a, *b, *c, *d]),
+        _ => None,
+    }
+}
+
+/// Whether this is the extended twin — see this module's docs.
+pub fn is_extended(manufacturer_data: &HashMap<u16, Vec<u8>>) -> bool {
+    manufacturer_data
+        .get(&COMPANY_ID)
+        .is_some_and(|data| data.len() == 5 && data[4] == EXTENDED_MARK)
 }
 
 /// The address a scan reported, if it reported one.
@@ -56,12 +92,8 @@ pub fn address_data(address: Option<Ipv4Addr>) -> Vec<u8> {
 /// saying `0.0.0.0`. The caller has the advertisement and can tell the first from the third; see
 /// `duckctl`'s listing, which does.
 pub fn address_in(manufacturer_data: &HashMap<u16, Vec<u8>>) -> Option<Ipv4Addr> {
-    let bytes: [u8; 4] = manufacturer_data
-        .get(&COMPANY_ID)?
-        .as_slice()
-        .try_into()
-        .ok()?;
-    Some(Ipv4Addr::from(bytes)).filter(|address| !address.is_unspecified())
+    Some(Ipv4Addr::from(address_bytes(manufacturer_data)?))
+        .filter(|address| !address.is_unspecified())
 }
 
 /// Whether this device broadcast an address field at all, however it reads.
@@ -70,9 +102,7 @@ pub fn address_in(manufacturer_data: &HashMap<u16, Vec<u8>>) -> Option<Ipv4Addr>
 /// that is not on wifi" are the two things a blank address could mean, and a listing that cannot
 /// tell them apart sends the reader to check the wrong thing.
 pub fn has_address_field(manufacturer_data: &HashMap<u16, Vec<u8>>) -> bool {
-    manufacturer_data
-        .get(&COMPANY_ID)
-        .is_some_and(|data| data.len() == 4)
+    address_bytes(manufacturer_data).is_some()
 }
 
 #[cfg(test)]
@@ -101,11 +131,28 @@ mod tests {
         assert!(!has_address_field(&nothing));
     }
 
-    /// Four bytes exactly. Anything else is another vendor using `0xFFFF`, or a format this
-    /// client does not know, and either way it is not an address.
+    /// The extended twin reads as the same address, and is the only one that says it is the twin.
+    #[test]
+    fn the_extended_twin_carries_the_same_address() {
+        let address = Ipv4Addr::new(192, 168, 1, 42);
+        let legacy = HashMap::from([(COMPANY_ID, address_data(Some(address)))]);
+        let extended = HashMap::from([(COMPANY_ID, extended_address_data(Some(address)))]);
+        assert_eq!(address_in(&extended), Some(address));
+        assert!(has_address_field(&extended));
+        assert!(is_extended(&extended));
+        assert!(!is_extended(&legacy));
+    }
+
+    /// Four bytes, or four and the mark. Anything else is another vendor using `0xFFFF`, or a
+    /// format this client does not know, and either way it is not an address.
     #[test]
     fn a_payload_of_the_wrong_length_is_not_an_address() {
-        for length in [0, 1, 3, 5, 16] {
+        let mut five = vec![1; 4];
+        five.push(EXTENDED_MARK + 1);
+        let data = HashMap::from([(COMPANY_ID, five)]);
+        assert_eq!(address_in(&data), None, "five bytes without the mark");
+        assert!(!is_extended(&data));
+        for length in [0, 1, 3, 6, 16] {
             let data = HashMap::from([(COMPANY_ID, vec![1; length])]);
             assert_eq!(address_in(&data), None, "{length} bytes");
             assert!(!has_address_field(&data), "{length} bytes");

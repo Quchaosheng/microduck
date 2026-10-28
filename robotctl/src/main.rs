@@ -39,16 +39,20 @@ use std::time::{Duration, Instant};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use duck_ipc_proto as proto;
 use robotd_params::Slot;
+use robotd_params::board::Board;
 
 mod camera;
 mod cells;
 mod configure;
 mod duck;
+mod endurance;
 mod frame;
 mod imu_view;
+mod led;
 mod monitor;
 mod path_map;
 mod show;
+mod vetbook;
 
 /// Exit codes. Stable — CI asserts on these.
 mod exit {
@@ -151,10 +155,53 @@ enum Namespace {
         command: RobotCommand,
     },
 
+    /// The face board's LEDs: list them, switch them, blink them. Bench tool for now — see
+    /// `robotctl led --help` and the module doc for who owns an LED once a daemon does.
+    #[command(subcommand_required = true, arg_required_else_help = true)]
+    Led {
+        #[command(subcommand)]
+        command: led::LedCommand,
+    },
+
+    /// Watch the head IMU live: roll, pitch and yaw of the head, and where it measures up.
+    ///
+    /// Head frame: `x` forward, `y` left, `z` up with the head level, so a level head reads
+    /// roll ≈ 0, pitch ≈ 0 and up ≈ (0, 0, 1). Yaw drifts from wherever the chip started: a game
+    /// rotation has no compass. Served by robotd on a beta; on a zero3 it is tofd's, and this
+    /// says so. Ctrl-C to stop.
+    HeadImu,
+
     /// Play this robot's quack. The loudest way to tell ducks apart: every robot's voice
     /// is generated from its SoC serial, so the one that answers — in a voice that is only
     /// its own — is the one you're SSH'd into.
     Quack,
+
+    /// The duck's vet book: its whole life in numbers.
+    ///
+    /// Hours awake, walking, standing and sitting; metres walked; falls, pickups, pets and
+    /// skills; and every servo — how long the one in each joint has run, how hot it has been,
+    /// what it has tripped on, and how long the ones before it lasted. `robotd` keeps it in
+    /// `/var/lib/robot/vetbook.json`, so it survives updates and lasts the life of the robot.
+    /// A servo swap is written down by itself, when `robotd` adopts a factory-fresh servo.
+    ///
+    /// On a terminal it opens a live page (`q` quits, `←`/`→` tabs, `n` writes a dated line in
+    /// the diary); piped, it prints plain text.
+    Vetbook {
+        /// The book as JSON, exactly as `robot.vetbook` answers it.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Switch the flashlight — the beta face's RGB LED. `robotd` owns it, so this asks rather than
+    /// writing the LED (`robotctl led` is the bench tool that writes it directly).
+    Flashlight {
+        /// `on`, `off` or `toggle`.
+        #[arg(value_parser = ["on", "off", "toggle"])]
+        state: String,
+        /// white, red, green, blue, yellow, cyan or magenta.
+        #[arg(long, default_value = "white")]
+        color: String,
+    },
 
     /// Sing with other ducks: two in a room start a piece between themselves, and more join.
     ///
@@ -334,6 +381,11 @@ enum Namespace {
         /// Machine-readable output, for scripts and support bundles.
         #[arg(long)]
         json: bool,
+        /// Check each update source now, before reporting, rather than reporting the last
+        /// scheduled check. Waits on the network, which is why it is not the default: the login
+        /// banner runs `robotctl health`.
+        #[arg(long)]
+        check: bool,
     },
 
     /// What is running on this robot, and what is installed. The first thing to ask for
@@ -344,6 +396,43 @@ enum Namespace {
         /// Machine-readable output, for support bundles and scripts.
         #[arg(long)]
         json: bool,
+    },
+
+    /// The tail of one daemon's journal, read by `configd` — so no `sudo` and no
+    /// `systemd-journal` group.
+    ///
+    /// The same call `duckctl logs` makes over Bluetooth, and the same fixed list of units. For
+    /// following or searching, `journalctl` is the tool; this is the short answer to "what did it
+    /// say".
+    Logs {
+        /// `robotd`, `btd`, `configd`, `updaterd`, `padd`, `mediad`, `tofd`, `bluetooth` or
+        /// `NetworkManager`. The `.service` suffix is optional.
+        #[arg(value_name = "SERVICE")]
+        service: String,
+        /// How many lines from the end. `configd` caps a reply at 500 lines and 48 KiB, and says
+        /// when it dropped older lines to fit.
+        #[arg(long, short = 'n', default_value_t = 100)]
+        lines: usize,
+        /// Which boot: `0` is this one, `-1` the one before it.
+        #[arg(long, short = 'b', default_value_t = 0, allow_hyphen_values = true)]
+        boot: i32,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Battery and heat test: walk, stand and sit at random near the start until the battery is
+    /// empty, logging charge, board temperatures and throttling to disk.
+    ///
+    /// Starts in the background (a transient systemd unit) and returns, so you can disconnect.
+    /// `robotd` sits the robot down and powers off at 0%; the log in /var/lib/endurance survives
+    /// that, and `scripts/endurance-plot.py` draws it. Needs root; no pad connected, since an
+    /// idle pad sends zero velocities that fight this one.
+    #[command(args_conflicts_with_subcommands = true)]
+    Endurance {
+        #[command(subcommand)]
+        command: Option<endurance::EnduranceCommand>,
+        #[command(flatten)]
+        args: endurance::EnduranceArgs,
     },
 
     /// Print a shell completion script on stdout.
@@ -557,6 +646,34 @@ fn run_quack(socket: &Path) -> Result<(), Failure> {
         return Err(Failure::new(exit::REFUSED, reason));
     }
     println!("🦆");
+    Ok(())
+}
+
+/// `robotctl flashlight` — ask `robotd` to switch the flashlight.
+fn run_flashlight(socket: &Path, state: &str, color: &str) -> Result<(), Failure> {
+    let color: proto::FlashlightColor =
+        serde_json::from_value(serde_json::Value::String(color.to_owned())).map_err(|_| {
+            Failure::new(
+                exit::USAGE,
+                format!("{color:?} is not white, red, green, blue, yellow, cyan or magenta"),
+            )
+        })?;
+    let mut client = Client::connect_to("robotd", socket)?;
+    client.hello()?;
+    let result = result_of(client.call(&proto::Call::RobotFlashlight(
+        proto::FlashlightParams {
+            on: state == "on",
+            toggle: state == "toggle",
+            color,
+        },
+    ))?)?;
+    let outcome: proto::IntentResult = decode(&result)?;
+    if !outcome.accepted {
+        let reason = outcome
+            .reason
+            .unwrap_or_else(|| "the robot refused".to_owned());
+        return Err(Failure::new(exit::REFUSED, reason));
+    }
     Ok(())
 }
 
@@ -809,9 +926,10 @@ enum PadCommand {
 
     /// What each of the pad's one-shot buttons runs.
     ///
-    /// Five are bindable: `a`, `x`, `lb`, `rb`, `dpad_down`. The rest are not skills — Start
-    /// toggles the policy, Y and B change what the sticks mean, held Select powers the robot
-    /// off — and the button that stops a robot is the one worth not being able to lose.
+    /// Six are bindable: `a`, `b`, `x`, `y`, `lb`, `rb`. The rest are not skills — Start stands
+    /// the robot up and toggles the policy, the D-pad changes what the sticks mean, held Select
+    /// cuts torque and powers the robot off — and the button that stops a robot is the one worth
+    /// not being able to lose.
     Bindings {
         #[arg(long)]
         json: bool,
@@ -823,8 +941,8 @@ enum PadCommand {
     /// policy list` names them — and an empty name switches the button off. `padd` notices
     /// within a second; nothing needs restarting.
     Bind {
-        /// `a`, `x`, `lb` or `rb` — the *bumpers*, since the analog triggers are the mouth and
-        /// the quack — or `dpad_down`.
+        /// `a`, `b`, `x`, `y`, `lb` or `rb` — the *bumpers*, since the analog triggers are the
+        /// mouth and the quack.
         button: String,
         /// A skill this robot has, or `""` to leave the button doing nothing.
         skill: String,
@@ -1258,6 +1376,77 @@ fn unreachable_hint(service: &str, path: &std::path::Path, e: &std::io::Error) -
     }
 }
 
+/// Roll, pitch and yaw (degrees, ZYX) of a scalar-first head→world quaternion, and the world's
+/// up expressed in the head frame.
+fn head_attitude(q: [f32; 4]) -> ([f32; 3], [f32; 3]) {
+    let [w, x, y, z] = q;
+    let roll = (2.0 * (w * x + y * z)).atan2(1.0 - 2.0 * (x * x + y * y));
+    let pitch = (2.0 * (w * y - z * x)).clamp(-1.0, 1.0).asin();
+    let yaw = (2.0 * (w * z + x * y)).atan2(1.0 - 2.0 * (y * y + z * z));
+    let up = [
+        2.0 * (x * z - w * y),
+        2.0 * (y * z + w * x),
+        1.0 - 2.0 * (x * x + y * y),
+    ];
+    (
+        [roll.to_degrees(), pitch.to_degrees(), yaw.to_degrees()],
+        up,
+    )
+}
+
+/// `robotctl head-imu`: subscribe on robotd's socket and redraw one line ~10 times a second.
+fn run_head_imu(robot_socket: &Path) -> Result<(), Failure> {
+    let mut client = Client::connect_to("robotd", robot_socket)?;
+    let response = client.call(&proto::Call::HeadImuStream)?;
+    let answer: proto::HeadImuStreamResult = response
+        .result
+        .clone()
+        .and_then(|r| serde_json::from_value(r).ok())
+        .ok_or_else(|| Failure::new(exit::FAILED, format!("unexpected answer: {response:?}")))?;
+    let Some(sensor) = answer.sensor else {
+        let why = answer
+            .unavailable
+            .unwrap_or_else(|| "no reason given".to_owned());
+        return Err(Failure::new(exit::FAILED, format!("no head IMU: {why}")));
+    };
+    println!(
+        "{sensor} at {} Hz, head frame: x forward, y left, z up. Ctrl-C to stop.",
+        answer.hz
+    );
+    let mut last_drawn = Instant::now() - Duration::from_secs(1);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = client
+            .reader
+            .read_line(&mut line)
+            .map_err(|e| Failure::new(exit::UNREACHABLE, format!("connection lost: {e}")))?;
+        if read == 0 {
+            println!();
+            return Err(Failure::new(
+                exit::UNREACHABLE,
+                "robotd closed the stream".into(),
+            ));
+        }
+        let Ok(note) = serde_json::from_str::<proto::Request>(line.trim()) else {
+            continue;
+        };
+        let Some(frame) = note.as_head_imu_frame() else {
+            continue;
+        };
+        if last_drawn.elapsed() < Duration::from_millis(100) {
+            continue;
+        }
+        last_drawn = Instant::now();
+        let ([roll, pitch, yaw], up) = head_attitude(frame.quat);
+        print!(
+            "\rroll {roll:+7.1}°  pitch {pitch:+7.1}°  yaw {yaw:+7.1}°   up ({:+.2}, {:+.2}, {:+.2})   gyro ({:+.2}, {:+.2}, {:+.2}) rad/s ",
+            up[0], up[1], up[2], frame.gyro[0], frame.gyro[1], frame.gyro[2]
+        );
+        let _ = std::io::stdout().flush();
+    }
+}
+
 /// A blocking JSON-RPC connection to `updaterd`.
 ///
 /// Deliberately `std::os::unix::net`, not tokio: this is a short-lived CLI issuing
@@ -1465,6 +1654,144 @@ struct ComponentReport {
     /// The last update attempt, as one line. `None` on a robot that has never updated.
     #[serde(skip_serializing_if = "Option::is_none")]
     last_attempt: Option<String>,
+    /// When the update source last answered, unix seconds — the same number, in the same unit,
+    /// that `robotctl update status --json` carries. A rendered "9 days ago" is what a person
+    /// wants and what a script cannot use: it cannot recompute the age, cannot apply the
+    /// threshold, and the phrase is wrong the moment it is stored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_checked: Option<i64>,
+    /// The last check, answered or not, as `update status --json` carries it — the error is the
+    /// one thing here that says why the source has gone quiet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_check_attempt: Option<proto::CheckAttempt>,
+    /// What that means, decided once where the clock and the daemon's version are both known.
+    /// The line and the warning both read it rather than re-deriving it from the timestamp.
+    #[serde(skip)]
+    source: SourceCheck,
+}
+
+impl ComponentReport {
+    /// Why the last check of the source got no answer. `None` when it got one, and when there has
+    /// been none or this `updaterd` does not say.
+    fn check_failure(&self) -> Option<&str> {
+        self.last_check_attempt.as_ref()?.error.as_deref()
+    }
+}
+
+/// What the record says about a component's update source.
+///
+/// A timestamp and an `Option` cannot carry this: absent means "this `updaterd` cannot say" and
+/// "it has never answered" both, and those want opposite treatment — the first is silence, the
+/// second is the loudest case there is. Deciding it once, here, is also what keeps a clock that
+/// has moved backwards from reading as a fresh check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SourceCheck {
+    /// An `updaterd` older than [`proto::API_LAST_CHECKED`], which does not carry the field.
+    /// Nothing is shown and nothing is warned: this robot is not being asked the question.
+    #[default]
+    Unsupported,
+    /// A daemon that would say, with nothing to say. The source has not answered once since this
+    /// board started recording — a robot blocked since it was provisioned, and the exact shape of
+    /// #282: no error anywhere, and an installed release that looks current.
+    ///
+    /// From an `updaterd` that records attempts, only when there has been one and it failed.
+    Never,
+    /// No check has run since this board started recording: an `updaterd` that has just started,
+    /// which is every board for the minute after an update. Said, not warned: until the first
+    /// check there is nothing to know, and warning then is a false alarm on every upgrade.
+    NotYet,
+    /// Checks are answered, but when is not written down: the clock was before the preflight
+    /// floor, which a `local_dir` source on a board with no RTC gets past. Not a quiet source.
+    Unrecorded,
+    /// It answered, this many seconds ago.
+    Answered(i64),
+    /// Recorded ahead of this clock, so the age is unknown. A board that checked with a fast
+    /// clock and then had it corrected backwards sits here — and clamping that to "0 days ago"
+    /// would pin it at fresh forever, because only a successful check overwrites the record and
+    /// by hypothesis there are none.
+    Ahead,
+}
+
+impl SourceCheck {
+    /// Read a component's status, with the API version of the `updaterd` that answered.
+    ///
+    /// Below [`proto::API_CHECK_ATTEMPT`] there is no attempt to read, and nothing recorded is
+    /// still "never": that daemon cannot tell a board that has just started from one that cannot
+    /// reach its source, and the second is the one that matters.
+    fn read(
+        last_checked: Option<i64>,
+        attempt: Option<&proto::CheckAttempt>,
+        api_version: Option<u32>,
+        now: i64,
+    ) -> Self {
+        let Some(api) = api_version.filter(|v| *v >= proto::API_LAST_CHECKED) else {
+            return Self::Unsupported;
+        };
+        if let Some(at) = last_checked {
+            return Self::at(at, now);
+        }
+        if api < proto::API_CHECK_ATTEMPT {
+            return Self::Never;
+        }
+        match attempt {
+            None => Self::NotYet,
+            Some(proto::CheckAttempt { error: Some(_), .. }) => Self::Never,
+            Some(proto::CheckAttempt { error: None, .. }) => Self::Unrecorded,
+        }
+    }
+
+    /// A recorded time this daemon did send, against this machine's clock.
+    fn at(at: i64, now: i64) -> Self {
+        if at > now {
+            Self::Ahead
+        } else {
+            Self::Answered(now - at)
+        }
+    }
+
+    /// The whole `health` line, in the unit a person would pick — whole, because "never" and "9
+    /// hours ago" do not finish the same sentence. `None` for a daemon that cannot say.
+    fn line(self) -> Option<String> {
+        match self {
+            Self::Unsupported => None,
+            Self::Never => Some("source has never answered on this robot".to_owned()),
+            Self::NotYet => {
+                Some("source not checked yet (`robotctl update check` checks it now)".to_owned())
+            }
+            Self::Unrecorded => {
+                Some("source answers, but when is not recorded: this clock was not set".to_owned())
+            }
+            Self::Ahead => Some(
+                "source last answered at a time this clock has not reached (not synced yet?)"
+                    .to_owned(),
+            ),
+            Self::Answered(age) => Some(format!("source last answered {}", describe_age(age))),
+        }
+    }
+
+    /// Whether this is worth saying without being asked, and the phrase for how long it has been.
+    fn quiet(self) -> Option<String> {
+        if !self.past_threshold() {
+            return None;
+        }
+        match self {
+            Self::Unsupported | Self::NotYet | Self::Unrecorded => None,
+            Self::Never => Some("has not answered once on this robot".to_owned()),
+            Self::Ahead => Some(
+                "last answered at a time this clock has not reached, so how long ago is not known"
+                    .to_owned(),
+            ),
+            Self::Answered(age) => Some(format!("has not answered in {} days", age / 86_400)),
+        }
+    }
+
+    fn past_threshold(self) -> bool {
+        match self {
+            Self::Unsupported | Self::NotYet | Self::Unrecorded => false,
+            Self::Never | Self::Ahead => true,
+            Self::Answered(age) => age / 86_400 >= QUIET_SOURCE_DAYS,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -1501,6 +1828,113 @@ struct HealthReport {
     /// GStreamer stack runs no `mediad`, and the units block is where that is reported.
     #[serde(skip_serializing_if = "Option::is_none")]
     camera: Option<proto::CameraStats>,
+    /// What `mediad`'s relay last published about the rendezvous service. `None` for the camera's
+    /// reasons, plus `--no-remote`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote: Option<proto::RemoteStatus>,
+    /// Who `updaterd` says this robot is signed in as — the account on disk, which is not always
+    /// the one the service listed it under. `None` when `updaterd` could not be asked, which the
+    /// software block already reports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account: Option<proto::AccountStatusResult>,
+    board: BoardReport,
+    /// This machine's clock when `remote` was read, so rendering stays pure.
+    #[serde(skip)]
+    read_at: i64,
+}
+
+/// Which board this robot is declared to be, and what its device tree says.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+struct BoardReport {
+    /// `[board] version` in `robotd.toml` — what everything that differs between boards reads.
+    /// `None` when the file does not say, which everything reads as `zero3`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    declared: Option<Board>,
+    /// What `/proc/device-tree/compatible` names, or `None` when it names nothing we know.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detected: Option<Board>,
+}
+
+impl BoardReport {
+    fn read() -> Self {
+        Self {
+            declared: Board::declared(Path::new(robotd_params::DEFAULT_PATH)),
+            detected: Board::detected(),
+        }
+    }
+
+    /// What is worth saying about the board: a declaration the hardware contradicts, and a board
+    /// whose updates are about to end.
+    ///
+    /// The declaration is not corrected, only questioned: it is what provisioning wrote, and the
+    /// device tree is a hint — which is why nothing else reads it.
+    /// The board everything acts on: the declared one, or `zero3` when there is none.
+    fn board(&self) -> Board {
+        self.declared.unwrap_or_default()
+    }
+
+    fn warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if let Some(detected) = self.detected.filter(|&d| d != self.board()) {
+            warnings.push(format!(
+                "robotd.toml declares a {declared} board, and the device tree looks like a \
+                 {detected}. The board decides which releases this robot can install. If the \
+                 device tree is right:\n  sudo robotctl configure  (board.version = \"{detected}\")",
+                declared = self.board(),
+            ));
+        }
+        if let Some(last) = self.board().last_release() {
+            warnings.push(format!(
+                "updates for the {} board end with release {last}: later releases will not \
+                 install on this robot.",
+                self.board()
+            ));
+        }
+        warnings
+    }
+}
+
+/// Offer to write the board the device tree names into a `robotd.toml` that declares none.
+///
+/// Only with a person at a terminal to answer, and only for a board the device tree names: the
+/// answer is theirs, and this asks once per run, from `robotctl health` and from `robotctl update
+/// apply`. A file this user cannot write gets a line saying how to be asked, rather than a
+/// question whose yes would fail. A missing file is not a robot to ask about.
+fn offer_to_declare_board(path: &Path) {
+    use std::io::{BufRead, IsTerminal, Write};
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return;
+    }
+    if !path.exists() || Board::declared(path).is_some() {
+        return;
+    }
+    let Some(detected) = Board::detected() else {
+        return;
+    };
+    if std::fs::OpenOptions::new().append(true).open(path).is_err() {
+        eprintln!(
+            "\nThis robot does not declare its board; the device tree says {detected}. \
+             Run this as root to be asked to declare it."
+        );
+        return;
+    }
+    eprint!(
+        "\nThis robot does not declare its board in {}; the device tree says {detected}. \
+         Declare it a {detected}? [y/N] ",
+        path.display()
+    );
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    if std::io::stdin().lock().read_line(&mut answer).is_err() {
+        return;
+    }
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        return;
+    }
+    match robotd_params::edit::set_board(path, detected) {
+        Ok(()) => eprintln!("declared: board.version = \"{detected}\""),
+        Err(e) => eprintln!("could not declare it: {e}"),
+    }
 }
 
 impl HealthReport {
@@ -1530,13 +1964,34 @@ fn run_health(
     robot_socket: &Path,
     config_socket: &Path,
     json: bool,
+    check: bool,
 ) -> Result<(), Failure> {
+    let not_checked = if check {
+        check_sources(socket)
+    } else {
+        Vec::new()
+    };
     let mut report = HealthReport {
         robot: None,
         robot_error: None,
         software: collect_version_report(socket, robot_socket, config_socket),
         camera: proto::read_camera_stats(),
+        remote: proto::read_remote_status(),
+        account: Client::connect(socket)
+            .ok()
+            .and_then(|mut client| client.call(&proto::Call::AccountStatus).ok())
+            .and_then(|response| response.result_as::<proto::AccountStatusResult>().ok()),
+        board: BoardReport::read(),
+        read_at: unix_now(),
     };
+    // Here rather than in `collect_version_report`, which `robotctl version` shares: `version`
+    // prints a component's name, release and revision and not the line this warning points at,
+    // so a robot that had gone quiet warned there about something nothing on screen said.
+    let quiet = quiet_source_warnings(&report.software.components);
+    report.software.warnings.extend(quiet);
+    report.software.warnings.extend(not_checked);
+    let board = report.board.warnings();
+    report.software.warnings.extend(board);
 
     match Client::connect_to("robotd", robot_socket) {
         Err(failure) => report.robot_error = Some(failure.message),
@@ -1559,6 +2014,7 @@ fn run_health(
         );
     } else {
         print!("{}", render_health(&report));
+        offer_to_declare_board(Path::new(robotd_params::DEFAULT_PATH));
     }
 
     match report.healthy() {
@@ -1615,6 +2071,14 @@ fn render_health(report: &HealthReport) -> String {
 
             let bus = match (health.bus.consecutive_errors, health.bus.startup_failures) {
                 (0, 0) => "ok".to_owned(),
+                // The servos that answered are a robot; the line is about the ones that did not.
+                (0, n) if health.bus.partly_missing() => {
+                    format!("missing {}, {n} attempts", health.bus.describe_missing())
+                }
+                // Every servo answered, so there is a robot; the IMU row says what is missing.
+                (0, n) if health.imu.is_some_and(|imu| imu.missing) => {
+                    format!("servos ok, waiting for the IMU board, {n} attempts")
+                }
                 (0, n) => format!("waiting for a robot to answer, {n} attempts"),
                 (n, _) => format!("{n} consecutive read failures"),
             };
@@ -1652,7 +2116,11 @@ fn render_health(report: &HealthReport) -> String {
                     out,
                     "  {:<9} {}{stale}",
                     "imu",
-                    if imu.ready { "ready" } else { "not ready" },
+                    match (imu.missing, imu.ready) {
+                        (true, _) => "not answering on the motor bus — is it plugged in?",
+                        (false, true) => "ready",
+                        (false, false) => "not ready",
+                    },
                 );
             }
 
@@ -1713,6 +2181,17 @@ fn render_health(report: &HealthReport) -> String {
         }
     }
 
+    let _ = writeln!(
+        out,
+        "board     {}{}",
+        report.board.board(),
+        if report.board.declared.is_none() {
+            " (not declared)"
+        } else {
+            ""
+        }
+    );
+
     // Between the robot verdict and the software block, because it is a fact about the hardware
     // rather than about which release is installed. Omitted entirely when `mediad` has published
     // nothing — "camera unknown" on a board with no camera is noise, and a `mediad` that is not
@@ -1738,6 +2217,10 @@ fn render_health(report: &HealthReport) -> String {
             "camera    {rate}, {}x{} {}{dropped} — {watching}",
             camera.width, camera.height, camera.format
         );
+    }
+
+    if let Some(line) = central_line(report) {
+        out.push_str(&line);
     }
 
     let _ = writeln!(out, "\nsoftware");
@@ -1774,6 +2257,12 @@ fn render_health(report: &HealthReport) -> String {
         );
         if let Some(attempt) = &component.last_attempt {
             let _ = writeln!(out, "  {:<9} last update {attempt}", "");
+        }
+        if let Some(line) = component.source.line() {
+            let _ = writeln!(out, "  {:<9} {line}", "");
+        }
+        if let Some(why) = component.check_failure() {
+            let _ = writeln!(out, "  {:<9} last check failed: {why}", "");
         }
     }
 
@@ -1835,6 +2324,8 @@ fn collect_version_report(
 
     // updaterd: running build, then what it says is installed.
     let mut updaterd_running: Option<semver::Version> = None;
+    // Which of the two silences an absent `last_checked` is — see [`SourceCheck`].
+    let mut updaterd_api: Option<u32> = None;
     match Client::connect(socket) {
         Err(failure) => report
             .services
@@ -1844,6 +2335,7 @@ fn collect_version_report(
             match hello {
                 Ok(hello) => {
                     updaterd_running = hello.daemon_version.clone();
+                    updaterd_api = Some(hello.api_version);
                     report.services.push(ServiceReport {
                         name: "updaterd",
                         version: hello.daemon_version.map(|v| v.to_string()),
@@ -1855,7 +2347,7 @@ fn collect_version_report(
                     .services
                     .push(ServiceReport::failed("updaterd", failure.message)),
             }
-            report.components = installed_components(&mut client);
+            report.components = installed_components(&mut client, updaterd_api);
         }
     }
 
@@ -1926,13 +2418,14 @@ fn collect_version_report(
 /// `listInstalled` knows the revision it was built from. Revision matters for support —
 /// once branch installs land, several builds share a version — so it is worth the extra
 /// round trip in a diagnostic command.
-fn installed_components(client: &mut Client) -> Vec<ComponentReport> {
+fn installed_components(client: &mut Client, api_version: Option<u32>) -> Vec<ComponentReport> {
     let Ok(response) = client.call(&proto::Call::Status) else {
         return Vec::new();
     };
     let Ok(statuses) = response.result_as::<Vec<proto::ComponentStatus>>() else {
         return Vec::new();
     };
+    let now = unix_now();
 
     statuses
         .into_iter()
@@ -1955,6 +2448,14 @@ fn installed_components(client: &mut Client) -> Vec<ComponentReport> {
                 revision,
                 pinned: status.pinned.map(|v| v.to_string()),
                 last_attempt: status.last_attempt.as_ref().map(describe_attempt),
+                last_checked: status.last_checked,
+                source: SourceCheck::read(
+                    status.last_checked,
+                    status.last_check_attempt.as_ref(),
+                    api_version,
+                    now,
+                ),
+                last_check_attempt: status.last_check_attempt,
             }
         })
         .collect()
@@ -1977,6 +2478,172 @@ fn describe_attempt(entry: &proto::LogEntry) -> String {
         proto::Outcome::RolledBack { reason } => format!("{target}: ROLLED BACK — {reason}"),
         proto::Outcome::Aborted { reason } => format!("{target}: refused — {reason}"),
     }
+}
+
+/// Seconds since the epoch, by this machine's clock.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// How long ago, in the unit a person would pick. Takes an age rather than a timestamp: a clock
+/// ahead of the record is not a duration, and [`SourceCheck`] has already sorted that out.
+fn describe_age(age: i64) -> String {
+    if age < 60 {
+        return "just now".to_owned();
+    }
+    let (count, unit) = if age < 3_600 {
+        (age / 60, "minute")
+    } else if age < 86_400 {
+        (age / 3_600, "hour")
+    } else {
+        (age / 86_400, "day")
+    };
+    let plural = if count == 1 { "" } else { "s" };
+    format!("{count} {unit}{plural} ago")
+}
+
+/// Past this, a registration whose heartbeat has not moved is called stale. The relay posts every
+/// ten seconds and the service evicts after thirty, so a minute is a relay that has stopped.
+const STALE_HEARTBEAT_SECONDS: i64 = 60;
+
+/// The `central` line: whether the rendezvous service lists this robot, and under which account.
+///
+/// Two sources, because the question has two halves that can disagree: `updaterd` knows the account
+/// on disk, and only the service knows whose robot list this robot is in. `None` when neither said
+/// anything — a robot with no `mediad` and no `updaterd` has other lines to worry about.
+fn central_line(report: &HealthReport) -> Option<String> {
+    let signed_in = report
+        .account
+        .as_ref()
+        .map(|status| status.account.as_ref().map(|a| a.username.as_str()));
+    let since = |at: i64| describe_age((report.read_at - at).max(0));
+    let signed_out = "not signed in: reachable on its own network only · `robotctl account login`";
+    let body = match (&report.remote, signed_in) {
+        (None, None) => return None,
+        (None, Some(None)) => signed_out.to_owned(),
+        (None, Some(Some(name))) => {
+            format!("signed in as {name}, connection not reported (is mediad running?)")
+        }
+        (Some(status), signed_in) => {
+            let signed_in = signed_in.flatten();
+            match &status.link {
+                proto::RemoteLink::SignedOut => signed_out.to_owned(),
+                proto::RemoteLink::Connecting => format!(
+                    "connecting{}, {}",
+                    signed_in.map(|n| format!(" as {n}")).unwrap_or_default(),
+                    since(status.since)
+                ),
+                proto::RemoteLink::Registered {
+                    account,
+                    last_heartbeat,
+                    ..
+                } => {
+                    let listed = account.as_deref().unwrap_or("an account it did not name");
+                    let beat = (report.read_at - last_heartbeat).max(0);
+                    let mut line = format!(
+                        "registered as {listed} {} · last heartbeat {beat} s ago",
+                        since(status.since)
+                    );
+                    if beat > STALE_HEARTBEAT_SECONDS {
+                        line.push_str(" — stale, mediad's relay may be stuck");
+                    }
+                    // The case this line was written for is the account being the wrong one, and
+                    // that is a person's mistake the robot cannot see. This one it can.
+                    if let (Some(listed), Some(on_disk)) = (account.as_deref(), signed_in)
+                        && listed != on_disk
+                    {
+                        line.push_str(&format!(
+                            "\n  {:<9} ! signed in as {on_disk}, but listed under {listed}",
+                            ""
+                        ));
+                    }
+                    line
+                }
+                proto::RemoteLink::Refused => format!(
+                    "the service refused the token{} {} · `robotctl account login`",
+                    signed_in.map(|n| format!(" for {n}")).unwrap_or_default(),
+                    since(status.since)
+                ),
+                proto::RemoteLink::Retrying { reason } => format!(
+                    "not connected, retrying (first failed {}): {}",
+                    since(status.since),
+                    reason.lines().next().unwrap_or("no reason given")
+                ),
+            }
+        }
+    };
+    Some(format!("central   {body}\n"))
+}
+
+/// `health --check`: have `updaterd` check every component's source now, so the report that
+/// follows says whether it answers rather than how the last scheduled check went.
+///
+/// The outcome is not read here. `updaterd` records it — the answer, or the failure and why — and
+/// the report reads that record like any other, so a check run here and one run by the timer
+/// print the same way. What only this can say is that a check did not run: an update in progress
+/// holds the engine, and without a line saying so the report would be read as fresh.
+///
+/// An `updaterd` that cannot be reached is left to the report, which already says so.
+fn check_sources(socket: &Path) -> Vec<String> {
+    let Ok(mut client) = Client::connect(socket) else {
+        return Vec::new();
+    };
+    let statuses = client
+        .call(&proto::Call::Status)
+        .ok()
+        .and_then(|r| r.result_as::<Vec<proto::ComponentStatus>>().ok())
+        .unwrap_or_default();
+    statuses
+        .into_iter()
+        .filter_map(|status| {
+            let response = client
+                .call(&proto::Call::Check(proto::ComponentParams {
+                    component: status.component.clone(),
+                }))
+                .ok()?;
+            let error = response.error?;
+            (error.code == proto::code::BUSY).then(|| {
+                format!(
+                    "the {} update source was not checked: an update is in progress. What is \
+                     shown is the last check before it.",
+                    status.component
+                )
+            })
+        })
+        .collect()
+}
+
+/// Past this, a quiet update source is said without being asked. A week is twenty-eight missed
+/// checks at the shipped six-hour interval, which is not a flaky link.
+const QUIET_SOURCE_DAYS: i64 = 7;
+
+/// A source that has not answered in a week, beside the pin and the last update. "Updates stopped
+/// arriving" is otherwise a symptom with nothing pointing at it, because a robot that cannot reach
+/// its source still reads as up to date.
+fn quiet_source_warnings(components: &[ComponentReport]) -> Vec<String> {
+    components
+        .iter()
+        .filter_map(|component| {
+            let how_long = component.source.quiet()?;
+            // The reason, when this `updaterd` records one; the journal is where it was before.
+            let why = match component.check_failure() {
+                Some(why) => format!(
+                    "The last check failed: {why}\n  \
+                     `robotctl update check` tries again now."
+                ),
+                None => "`journalctl -u updaterd` has each attempt and why.".to_owned(),
+            };
+            Some(format!(
+                "the {} update source {how_long}.\n  \
+                 A robot that cannot reach it still reads as up to date, because the only thing\n  \
+                 that fails is the check. {why}",
+                component.name
+            ))
+        })
+        .collect()
 }
 
 /// Disagreements worth telling a human about.
@@ -2341,6 +3008,7 @@ fn render_version(report: &VersionReport) -> String {
 }
 
 /// An error carrying the exit code it should produce.
+#[derive(Debug)]
 struct Failure {
     code: u8,
     message: String,
@@ -2555,6 +3223,61 @@ fn render_account(status: &proto::AccountStatusResult) -> String {
         let _ = writeln!(out, "last login attempt: {error}");
     }
     out
+}
+
+/// `robotctl logs` — a journal tail from `configd`'s `system.logs`.
+///
+/// The lines go to stdout and everything about them to stderr, so `robotctl logs robotd | grep
+/// panic` sees only what the daemon logged.
+fn run_logs(
+    socket: &Path,
+    service: String,
+    lines: usize,
+    boot: i32,
+    json: bool,
+) -> Result<(), Failure> {
+    let mut client = Client::connect_to("configd", socket)?;
+    client.hello()?;
+
+    let call = proto::Call::SystemLogs(proto::LogsParams {
+        unit: service,
+        lines,
+        boot,
+    });
+    let result = result_of(client.call(&call)?)?;
+    if json {
+        println!("{}", compact(&result));
+        return Ok(());
+    }
+
+    let tail: proto::LogsResult = decode(&result)?;
+    for line in &tail.lines {
+        println!("{line}");
+    }
+    if let Some(note) = logs_note(&tail, boot) {
+        eprintln!("{note}");
+    }
+    Ok(())
+}
+
+/// What a tail cannot say about itself: that it is empty, or that it is not all that was asked for.
+fn logs_note(tail: &proto::LogsResult, boot: i32) -> Option<String> {
+    let unit = &tail.unit;
+    if tail.lines.is_empty() {
+        // A daemon that has not run this boot is a real answer, and a different one from a daemon
+        // that is running and silent — `systemctl status` tells them apart.
+        return Some(format!(
+            "no lines for {unit} in boot {boot} — it may not have run then. \
+             `systemctl status {unit}` says whether it is running now."
+        ));
+    }
+    if tail.truncated {
+        return Some(format!(
+            "note: older lines were dropped to fit one reply. For more, \
+             `journalctl -u {unit} --boot={boot}`."
+        ));
+    }
+    None
 }
 
 /// Ask `configd` one question and print the answer.
@@ -4147,7 +4870,7 @@ fn robot_skills(robot_socket: &Path) -> Option<Vec<String>> {
     Some(ack.skills)
 }
 
-fn run_pad(socket: &Path, command: PadCommand) -> Result<(), Failure> {
+fn run_pad(socket: &Path, config: &Path, command: PadCommand) -> Result<(), Failure> {
     let mut client = Client::connect_to("configd", socket)?;
     client.hello()?;
 
@@ -4193,7 +4916,9 @@ fn run_pad(socket: &Path, command: PadCommand) -> Result<(), Failure> {
     }
 
     match command {
-        PadCommand::Status { .. } => println!("{}", render_pad_status(&result)?),
+        PadCommand::Status { .. } => {
+            println!("{}", render_pad_status(&result, udp_selected(config))?)
+        }
         PadCommand::Pair { .. } => return report_pair(&result),
         PadCommand::Bindings { .. } | PadCommand::Bind { .. } | PadCommand::Reset { .. } => {
             unreachable!("bindings, bind and reset returned before this point")
@@ -4218,7 +4943,15 @@ fn run_pad(socket: &Path, command: PadCommand) -> Result<(), Failure> {
     Ok(())
 }
 
-fn render_pad_status(result: &serde_json::Value) -> Result<String, Failure> {
+/// Whether `[netpad] enabled` gives the pad to netpadd — the question padd's own `ExecCondition=`
+/// asks, answered the same way: a file that cannot be read counts as not enabled, as it does for
+/// padd, so this never explains a stand-down that did not happen.
+fn udp_selected(config: &Path) -> bool {
+    robotd_params::Params::load(config, false).is_ok_and(|p| p.netpad.enabled)
+}
+
+/// `udp` is whether `[netpad] enabled` is set, which is what an inactive `padd` means then.
+fn render_pad_status(result: &serde_json::Value, udp: bool) -> Result<String, Failure> {
     use std::fmt::Write;
     let status: proto::PadStatusResult = decode(result)?;
 
@@ -4252,6 +4985,11 @@ fn render_pad_status(result: &serde_json::Value) -> Result<String, Failure> {
             .to_owned(),
         proto::UnitState::Failed => "FAILED to start — check:  \
                                      sudo journalctl -u padd -b | tail -30"
+            .to_owned(),
+        // Stood down, not stopped: padd's `ExecCondition=` skips it when the pad is over UDP.
+        // Advising a start here would be advising the one thing that selection exists to prevent.
+        proto::UnitState::Inactive if udp => "standing down — `[netpad] enabled` hands the pad \
+                                              to netpadd; see docs/robot/udp-pad.md"
             .to_owned(),
         proto::UnitState::Inactive => {
             "NOT running — start it:  sudo systemctl start padd".to_owned()
@@ -4564,11 +5302,20 @@ fn resolve_from_dir(dir: &std::path::Path) -> Result<String, Failure> {
 fn run(cli: Cli) -> Result<(), Failure> {
     let command = match cli.namespace {
         Namespace::Frame { output } => return frame::run(&cli.media_socket, &output),
-        Namespace::Health { json } => {
-            return run_health(&cli.socket, &cli.robot_socket, &cli.config_socket, json);
+        Namespace::Health { json, check } => {
+            return run_health(
+                &cli.socket,
+                &cli.robot_socket,
+                &cli.config_socket,
+                json,
+                check,
+            );
         }
         Namespace::Version { json } => {
             return run_version(&cli.socket, &cli.robot_socket, &cli.config_socket, json);
+        }
+        Namespace::Vetbook { json } => {
+            return vetbook::run(&cli.robot_socket, &cli.config_socket, &cli.socket, json);
         }
         Namespace::Monitor { hz, json } => {
             return monitor::run(
@@ -4592,6 +5339,14 @@ fn run(cli: Cli) -> Result<(), Failure> {
             );
             return Ok(());
         }
+        Namespace::Logs {
+            service,
+            lines,
+            boot,
+            json,
+        } => {
+            return run_logs(&cli.config_socket, service, lines, boot, json);
+        }
         Namespace::Net { command } => {
             return run_net(&cli.config_socket, command);
         }
@@ -4605,7 +5360,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             ) {
                 return run_pad_bindings(&cli.robot_socket, &cli.pad_config, command);
             }
-            return run_pad(&cli.config_socket, command);
+            return run_pad(&cli.config_socket, &cli.pad_config, command);
         }
         Namespace::Account { command } => {
             return run_account(&cli.socket, command);
@@ -4626,8 +5381,20 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Namespace::Robot { command } => {
             return run_robot(&cli.robot_socket, command);
         }
+        Namespace::Endurance { command, args } => {
+            return endurance::run(&cli.robot_socket, command, args);
+        }
         Namespace::Quack => {
             return run_quack(&cli.robot_socket);
+        }
+        Namespace::Flashlight { state, color } => {
+            return run_flashlight(&cli.robot_socket, &state, &color);
+        }
+        Namespace::HeadImu => {
+            return run_head_imu(&cli.robot_socket);
+        }
+        Namespace::Led { command } => {
+            return led::run(Path::new(led::LEDS_DIR), command);
         }
         Namespace::Theremin { off } => {
             return run_theremin(&cli.robot_socket, off);
@@ -4652,6 +5419,11 @@ fn run(cli: Cli) -> Result<(), Failure> {
     let component = |name: &str| proto::ComponentParams {
         component: proto::ComponentId::new(name),
     };
+    // Before the apply, not after: the board is the hardware revision this robot checks the
+    // release against.
+    if matches!(command, UpdateCommand::Apply { .. }) {
+        offer_to_declare_board(Path::new(robotd_params::DEFAULT_PATH));
+    }
     let call = match &command {
         UpdateCommand::Check { component: name } => {
             proto::Call::Check(component(name.as_deref().unwrap_or("daemon")))
@@ -4784,6 +5556,23 @@ fn print_result(command: &UpdateCommand, result: serde_json::Value) {
                         if let Some(last) = &status.last_attempt {
                             println!("  last attempt: {}", compact(last));
                         }
+                        // No `hello` on this path, so an absent value stays silent rather than
+                        // claiming a source that has never answered: `robotctl health` is where
+                        // the two silences are told apart.
+                        if let Some(line) = status
+                            .last_checked
+                            .map(|at| SourceCheck::at(at, unix_now()))
+                            .and_then(SourceCheck::line)
+                        {
+                            println!("  {line}");
+                        }
+                        if let Some(why) = status
+                            .last_check_attempt
+                            .as_ref()
+                            .and_then(|attempt| attempt.error.as_deref())
+                        {
+                            println!("  last check failed: {why}");
+                        }
                     }
                 }
             }
@@ -4887,7 +5676,108 @@ fn compact(value: &impl serde::Serialize) -> String {
     serde_json::to_string(value).unwrap_or_default()
 }
 #[cfg(test)]
+mod head_imu_tests {
+    use super::head_attitude;
+
+    #[test]
+    fn a_level_head_reads_zero_and_up_is_z() {
+        let (rpy, up) = head_attitude([1.0, 0.0, 0.0, 0.0]);
+        assert!(rpy.iter().all(|a| a.abs() < 1e-4), "{rpy:?}");
+        assert!((up[2] - 1.0).abs() < 1e-6 && up[0].abs() < 1e-6 && up[1].abs() < 1e-6);
+    }
+
+    /// Nose down is positive pitch about y (right-handed, y left), and up then leans back, toward
+    /// -x: the forward axis now points partly down.
+    #[test]
+    fn nose_down_is_positive_pitch() {
+        let half = 15f32.to_radians();
+        let (rpy, up) = head_attitude([half.cos(), 0.0, half.sin(), 0.0]);
+        assert!((rpy[1] - 30.0).abs() < 1e-3, "{rpy:?}");
+        assert!((up[0] + 0.5).abs() < 1e-3, "{up:?}");
+    }
+}
+
+#[cfg(test)]
 mod tests {
+
+    // ── robotctl logs ────────────────────────────────────────────────────
+
+    #[test]
+    fn the_previous_boot_parses_as_a_negative_offset() {
+        let cli = Cli::try_parse_from(["robotctl", "logs", "robotd", "-b", "-1", "-n", "20"])
+            .expect("`logs robotd -b -1` must parse");
+        let Namespace::Logs {
+            service,
+            lines,
+            boot,
+            json,
+        } = cli.namespace
+        else {
+            panic!("expected logs, got {:?}", cli.namespace);
+        };
+        assert_eq!(
+            (service.as_str(), lines, boot, json),
+            ("robotd", 20, -1, false)
+        );
+    }
+
+    fn tail(lines: &[&str], truncated: bool) -> proto::LogsResult {
+        proto::LogsResult {
+            unit: "robotd.service".to_owned(),
+            lines: lines.iter().map(|l| (*l).to_owned()).collect(),
+            truncated,
+        }
+    }
+
+    #[test]
+    fn a_complete_tail_has_nothing_to_add() {
+        assert_eq!(logs_note(&tail(&["robotd[42]: up"], false), 0), None);
+    }
+
+    #[test]
+    fn an_empty_tail_says_so_rather_than_printing_nothing() {
+        let note = logs_note(&tail(&[], false), -1).expect("an empty tail is explained");
+        assert!(note.contains("boot -1"), "{note}");
+        assert!(note.contains("systemctl status robotd.service"), "{note}");
+    }
+
+    #[test]
+    fn a_truncated_tail_points_at_the_whole_journal() {
+        let note = logs_note(&tail(&["robotd[42]: up"], true), 0).expect("truncation is noted");
+        assert!(
+            note.contains("journalctl -u robotd.service --boot=0"),
+            "{note}"
+        );
+    }
+
+    // ── robotctl pad status ──────────────────────────────────────────────
+
+    /// `padd` inactive is two different robots: one where it should be running and is not, and
+    /// one where `[netpad] enabled` stood it down for netpadd. Telling the second to start padd
+    /// would hand the pad back to Bluetooth by hand, until the next restart undid it.
+    #[test]
+    fn an_inactive_padd_is_a_stand_down_when_the_pad_is_over_udp() {
+        let inactive = serde_json::to_value(proto::PadStatusResult {
+            pads: Vec::new(),
+            driver: proto::UnitState::Inactive,
+        })
+        .unwrap();
+
+        let bluetooth =
+            render_pad_status(&inactive, false).unwrap_or_else(|e| panic!("{}", e.message));
+        assert!(
+            bluetooth.contains("sudo systemctl start padd"),
+            "{bluetooth}"
+        );
+
+        let udp = render_pad_status(&inactive, true).unwrap_or_else(|e| panic!("{}", e.message));
+        assert!(!udp.contains("systemctl start padd"), "{udp}");
+        assert!(
+            udp.contains("[netpad] enabled") && udp.contains("netpadd"),
+            "{udp}"
+        );
+        assert!(udp.contains("udp-pad.md"), "{udp}");
+    }
 
     // ── robotctl policy ──────────────────────────────────────────────────
     //
@@ -5762,7 +6652,187 @@ mod tests {
             robot_error: robot_error.map(str::to_owned),
             software: report(vec![service("robotd", "0.2.0")], Some("0.2.0")),
             camera: None,
+            remote: None,
+            account: None,
+            board: BoardReport {
+                declared: Some(Board::Zero3),
+                detected: Some(Board::Zero3),
+            },
+            read_at: 1_000_000,
         }
+    }
+
+    #[test]
+    fn health_names_the_declared_board() {
+        let mut report = health_report(None, Some("no robotd"));
+        let out = render_health(&report);
+        assert!(out.contains("board     zero3\n"), "{out}");
+        report.board.declared = None;
+        let out = render_health(&report);
+        assert!(out.contains("board     zero3 (not declared)"), "{out}");
+    }
+
+    /// A board agreeing with its device tree, or one whose device tree names nothing we know, is
+    /// not worth a line. One the device tree contradicts is, with the command that fixes it.
+    #[test]
+    fn health_questions_a_board_the_device_tree_contradicts() {
+        let board = |declared, detected| BoardReport { declared, detected };
+        assert!(
+            board(Some(Board::Zero3), Some(Board::Zero3))
+                .warnings()
+                .is_empty()
+        );
+        assert!(board(None, Some(Board::Zero3)).warnings().is_empty());
+        assert!(board(Some(Board::Beta), None).warnings().is_empty());
+        assert_eq!(board(None, Some(Board::Beta)).warnings().len(), 1);
+
+        let warnings = board(Some(Board::Zero3), Some(Board::Beta)).warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("declares a zero3 board"),
+            "{}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("board.version = \"beta\""),
+            "{}",
+            warnings[0]
+        );
+    }
+
+    /// `updaterd` saying the robot is signed in as `name`, or signed in to nothing.
+    fn signed_in_as(name: Option<&str>) -> proto::AccountStatusResult {
+        proto::AccountStatusResult {
+            account: name.map(|username| proto::Account {
+                username: username.to_owned(),
+                token_expires_in: 30 * 86_400,
+                refreshable: true,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// What `mediad` published, `ago` seconds before the report was read.
+    fn remote(link: proto::RemoteLink, ago: i64) -> proto::RemoteStatus {
+        proto::RemoteStatus {
+            service: "https://pollen-robotics-reachy-mini-central.hf.space".to_owned(),
+            since: 1_000_000 - ago,
+            link,
+        }
+    }
+
+    fn registered(account: &str, heartbeat_ago: i64) -> proto::RemoteLink {
+        proto::RemoteLink::Registered {
+            account: Some(account.to_owned()),
+            peer_id: "87a14833".to_owned(),
+            last_heartbeat: 1_000_000 - heartbeat_ago,
+        }
+    }
+
+    /// The line this exists for: registered, under which account, and still alive.
+    #[test]
+    fn health_says_which_account_the_central_lists_the_robot_under() {
+        let mut report = health_report(None, None);
+        report.remote = Some(remote(registered("cduss", 4), 11 * 60));
+        report.account = Some(signed_in_as(Some("cduss")));
+        let out = render_health(&report);
+
+        assert!(
+            out.contains("central   registered as cduss 11 minutes ago · last heartbeat 4 s ago\n"),
+            "{out}"
+        );
+        assert!(
+            !out.contains('!'),
+            "matching accounts are not a warning: {out}"
+        );
+    }
+
+    /// The account on disk and the account the service resolved it to disagree — say both.
+    #[test]
+    fn health_flags_a_robot_listed_under_another_account() {
+        let mut report = health_report(None, None);
+        report.remote = Some(remote(registered("cduss", 4), 60));
+        report.account = Some(signed_in_as(Some("pierre")));
+        let out = render_health(&report);
+
+        assert!(
+            out.contains("! signed in as pierre, but listed under cduss"),
+            "{out}"
+        );
+    }
+
+    /// A heartbeat that has stopped moving is a relay that has stopped, whatever the state says.
+    #[test]
+    fn health_calls_a_heartbeat_that_stopped_moving_stale() {
+        let mut report = health_report(None, None);
+        report.remote = Some(remote(registered("cduss", 300), 3_600));
+        let out = render_health(&report);
+
+        assert!(out.contains("last heartbeat 300 s ago — stale"), "{out}");
+    }
+
+    #[test]
+    fn health_says_why_the_robot_is_not_in_the_list() {
+        let mut report = health_report(None, None);
+        report.account = Some(signed_in_as(Some("cduss")));
+
+        report.remote = Some(remote(proto::RemoteLink::Refused, 120));
+        let out = render_health(&report);
+        assert!(
+            out.contains(
+                "central   the service refused the token for cduss 2 minutes ago · `robotctl account login`"
+            ),
+            "{out}"
+        );
+
+        report.remote = Some(remote(
+            proto::RemoteLink::Retrying {
+                reason: "GET https://x/events: HTTP 503".to_owned(),
+            },
+            300,
+        ));
+        let out = render_health(&report);
+        assert!(
+            out.contains(
+                "central   not connected, retrying (first failed 5 minutes ago): GET https://x/events: HTTP 503"
+            ),
+            "{out}"
+        );
+
+        report.remote = Some(remote(proto::RemoteLink::SignedOut, 300));
+        report.account = Some(signed_in_as(None));
+        let out = render_health(&report);
+        assert!(out.contains("central   not signed in"), "{out}");
+    }
+
+    /// Nothing from `mediad` — stopped, `--no-remote`, or older than this — falls back to the
+    /// account alone, and to no line at all when there is not even that.
+    #[test]
+    fn health_without_a_published_status_falls_back_to_the_account() {
+        let mut report = health_report(None, None);
+        assert!(!render_health(&report).contains("central"));
+
+        report.account = Some(signed_in_as(Some("cduss")));
+        let out = render_health(&report);
+        assert!(
+            out.contains("central   signed in as cduss, connection not reported"),
+            "{out}"
+        );
+    }
+
+    /// The published file is what `mediad` writes and this reads; the tagged, flattened shape is
+    /// the one easy to get wrong between the two.
+    #[test]
+    fn remote_status_round_trips_as_mediad_writes_it() {
+        let status = remote(registered("cduss", 4), 60);
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["state"], "registered");
+        assert_eq!(json["account"], "cduss");
+        assert_eq!(json["peerId"], "87a14833");
+        assert_eq!(
+            serde_json::from_value::<proto::RemoteStatus>(json).unwrap(),
+            status
+        );
     }
 
     fn camera_stats(fps: f64, dropped: u64, consumers: u32) -> proto::CameraStats {
@@ -5850,6 +6920,7 @@ mod tests {
                     ready: true,
                     stale_blocks: 0,
                     consecutive_stale_blocks: 0,
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -5990,6 +7061,7 @@ mod tests {
                     ready: false,
                     stale_blocks: 0,
                     consecutive_stale_blocks: 0,
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -6023,11 +7095,13 @@ mod tests {
                 bus: proto::BusHealth {
                     consecutive_errors: 7,
                     startup_failures: 0,
+                    ..Default::default()
                 },
                 imu: Some(proto::ImuHealth {
                     ready: true,
                     stale_blocks: 41,
                     consecutive_stale_blocks: 41,
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -6037,6 +7111,43 @@ mod tests {
         assert!(out.contains("7 consecutive read failures"), "{out}");
         assert!(out.contains("orientation frozen"), "{out}");
         assert!(out.contains("41 stale reads running"), "{out}");
+    }
+
+    /// A silent IMU board is named on its own row, and the bus row does not go looking for a robot
+    /// whose servos have all answered.
+    #[test]
+    fn health_renders_a_silent_imu_board() {
+        let out = render_health(&health_report(
+            Some(proto::HealthResult {
+                healthy: false,
+                degraded: true,
+                reason: Some(
+                    "the IMU board (id 200) is not answering on the motor bus after 4 attempts; \
+                     is it plugged in?"
+                        .into(),
+                ),
+                bus: proto::BusHealth {
+                    startup_failures: 4,
+                    ..Default::default()
+                },
+                imu: Some(proto::ImuHealth {
+                    missing: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            None,
+        ));
+
+        assert!(
+            out.contains("bus       servos ok, waiting for the IMU board, 4 attempts"),
+            "{out}"
+        );
+        assert!(
+            out.contains("imu       not answering on the motor bus"),
+            "{out}"
+        );
+        assert!(!out.contains("waiting for a robot"), "{out}");
     }
 
     /// A handful of stale reads over a long run is a healthy board, and must not wear an alarm.
@@ -6063,6 +7174,7 @@ mod tests {
                     stale_blocks: 9,
                     // The board refreshed on the most recent read, so nothing is frozen.
                     consecutive_stale_blocks: 0,
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -6093,6 +7205,7 @@ mod tests {
                     ready: true,
                     stale_blocks: 2,
                     consecutive_stale_blocks: 1,
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -6115,6 +7228,7 @@ mod tests {
                     ready: true,
                     stale_blocks: 3,
                     consecutive_stale_blocks: 0,
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -6136,6 +7250,7 @@ mod tests {
                 bus: proto::BusHealth {
                     consecutive_errors: 0,
                     startup_failures: 4,
+                    ..Default::default()
                 },
                 ..Default::default()
             }),
@@ -6143,6 +7258,47 @@ mod tests {
         ));
 
         assert!(out.contains("degraded: no robot on the motor bus"), "{out}");
+        assert!(
+            out.contains("waiting for a robot to answer, 4 attempts"),
+            "{out}"
+        );
+    }
+
+    /// **Some servos answering is a robot, not "no robot".** What a beta with its head servos
+    /// unplugged showed as "no robot on the motor bus" while robotd's log named the three.
+    #[test]
+    fn health_names_the_servos_that_are_missing() {
+        let out = render_health(&health_report(
+            Some(proto::HealthResult {
+                degraded: true,
+                bus: proto::BusHealth {
+                    startup_failures: 4,
+                    missing: vec![32, 33, 34],
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            None,
+        ));
+        assert!(
+            out.contains("missing 32 head_yaw, 33 head_roll, 34 mouth, 4 attempts"),
+            "{out}"
+        );
+        assert!(!out.contains("waiting for a robot to answer"), "{out}");
+
+        // All fifteen silent is still servo power, in the words people already know.
+        let out = render_health(&health_report(
+            Some(proto::HealthResult {
+                degraded: true,
+                bus: proto::BusHealth {
+                    startup_failures: 4,
+                    missing: proto::JOINT_IDS.to_vec(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            None,
+        ));
         assert!(
             out.contains("waiting for a robot to answer, 4 attempts"),
             "{out}"
@@ -6163,6 +7319,8 @@ mod tests {
             reason: reason.map(str::to_owned),
             pinned: None,
             last_attempt: None,
+            last_checked: None,
+            last_check_attempt: None,
         }
     }
 
@@ -6284,6 +7442,188 @@ mod tests {
         assert_eq!(describe_attempt(&first), "0.2.0: applied");
     }
 
+    /// When the source last answered, in the unit a person would pick.
+    #[test]
+    fn a_check_is_described_by_how_long_ago_it_was() {
+        assert_eq!(describe_age(5), "just now");
+        assert_eq!(describe_age(60), "1 minute ago");
+        assert_eq!(describe_age(3 * 3_600), "3 hours ago");
+        assert_eq!(describe_age(47 * 86_400), "47 days ago");
+    }
+
+    /// A week of silence is a warning without being asked for, and the line is in `health` either
+    /// way. A source that answered this morning, or an `updaterd` too old to say, warns nothing.
+    #[test]
+    fn a_quiet_update_source_is_said_without_being_asked() {
+        let mut report = health_report(Some(proto::HealthResult::default()), None);
+        report.software.components[0].source = SourceCheck::Answered(9 * 86_400);
+
+        let out = render_health(&report);
+        assert!(out.contains("source last answered 9 days ago"), "{out}");
+        let warnings = quiet_source_warnings(&report.software.components);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("has not answered in 9 days"),
+            "{warnings:?}"
+        );
+
+        report.software.components[0].source = SourceCheck::Answered(3 * 3_600);
+        assert!(quiet_source_warnings(&report.software.components).is_empty());
+        report.software.components[0].source = SourceCheck::Unsupported;
+        assert!(quiet_source_warnings(&report.software.components).is_empty());
+        assert!(!render_health(&report).contains("source"), "{out}");
+    }
+
+    /// The case the whole report exists for: a robot that has never once reached its source —
+    /// blocked since it was provisioned — and so has nothing recorded. Reading that as "no
+    /// answer yet, say nothing" printed exactly what a healthy robot prints, which is #282
+    /// with the fix installed.
+    #[test]
+    fn a_source_that_never_answered_is_the_loudest_case_not_the_quietest() {
+        let mut report = health_report(Some(proto::HealthResult::default()), None);
+        report.software.components[0].source = SourceCheck::Never;
+
+        let out = render_health(&report);
+        assert!(out.contains("source has never answered"), "{out}");
+        let warnings = quiet_source_warnings(&report.software.components);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("has not answered once"),
+            "{warnings:?}"
+        );
+    }
+
+    /// Which is only distinguishable from an `updaterd` that cannot say with the API version in
+    /// hand. Both send no timestamp.
+    #[test]
+    fn an_absent_timestamp_is_read_against_the_daemons_api_version() {
+        let now = 1_800_000_000;
+        let v35 = Some(proto::API_LAST_CHECKED);
+        assert_eq!(
+            SourceCheck::read(None, None, None, now),
+            SourceCheck::Unsupported
+        );
+        assert_eq!(
+            SourceCheck::read(None, None, Some(proto::API_LAST_CHECKED - 1), now),
+            SourceCheck::Unsupported
+        );
+        assert_eq!(SourceCheck::read(None, None, v35, now), SourceCheck::Never);
+        assert_eq!(
+            SourceCheck::read(Some(now - 600), None, v35, now),
+            SourceCheck::Answered(600)
+        );
+    }
+
+    /// From an `updaterd` that records attempts, nothing recorded is three things, and only one of
+    /// them is the source not answering.
+    #[test]
+    fn an_absent_timestamp_is_read_against_the_last_attempt() {
+        let now = 1_800_000_000;
+        let v37 = Some(proto::API_CHECK_ATTEMPT);
+        let failed = proto::CheckAttempt {
+            at: now - 60,
+            error: Some("network error: dns error".into()),
+        };
+        let answered = proto::CheckAttempt {
+            at: 86_400,
+            error: None,
+        };
+        assert_eq!(SourceCheck::read(None, None, v37, now), SourceCheck::NotYet);
+        assert_eq!(
+            SourceCheck::read(None, Some(&failed), v37, now),
+            SourceCheck::Never
+        );
+        assert_eq!(
+            SourceCheck::read(None, Some(&answered), v37, now),
+            SourceCheck::Unrecorded
+        );
+        assert_eq!(
+            SourceCheck::read(Some(now - 600), Some(&failed), v37, now),
+            SourceCheck::Answered(600),
+            "a failure after an answer does not unmake the answer"
+        );
+    }
+
+    /// The minute after `updaterd` starts, before its first check. That warned "has not answered
+    /// once" on every board just updated to the release that brought the record in, which is
+    /// the one moment someone is looking.
+    #[test]
+    fn a_source_not_checked_yet_is_said_and_not_warned() {
+        let mut report = health_report(Some(proto::HealthResult::default()), None);
+        report.software.components[0].source = SourceCheck::NotYet;
+
+        let out = render_health(&report);
+        assert!(out.contains("source not checked yet"), "{out}");
+        assert!(out.contains("robotctl update check"), "{out}");
+        assert!(quiet_source_warnings(&report.software.components).is_empty());
+    }
+
+    /// A source that keeps failing says why, in the warning and beside the line, rather than
+    /// pointing at the journal.
+    #[test]
+    fn a_failing_source_says_why() {
+        let why = "network error: GET https://x/manifest.json: error sending request: dns error";
+        let mut report = health_report(Some(proto::HealthResult::default()), None);
+        report.software.components[0].source = SourceCheck::Never;
+        report.software.components[0].last_check_attempt = Some(proto::CheckAttempt {
+            at: 1_800_000_000,
+            error: Some(why.into()),
+        });
+
+        let out = render_health(&report);
+        assert!(out.contains(&format!("last check failed: {why}")), "{out}");
+        let warnings = quiet_source_warnings(&report.software.components);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains(why), "{warnings:?}");
+        assert!(
+            warnings[0].contains("robotctl update check"),
+            "{warnings:?}"
+        );
+        assert!(!warnings[0].contains("journalctl"), "{warnings:?}");
+
+        // Answered this morning, failing since: said, and under the week it is not a warning.
+        report.software.components[0].source = SourceCheck::Answered(3 * 3_600);
+        let out = render_health(&report);
+        assert!(out.contains("source last answered 3 hours ago"), "{out}");
+        assert!(out.contains("last check failed"), "{out}");
+        assert!(quiet_source_warnings(&report.software.components).is_empty());
+    }
+
+    /// A clock corrected backwards after a check must not read as a fresh one. Clamping the age
+    /// at zero pinned it there for good: only a successful check overwrites the record, and this
+    /// is the robot that is not getting one.
+    #[test]
+    fn a_record_ahead_of_this_clock_warns_rather_than_reading_as_fresh() {
+        let now = 1_800_000_000;
+        let ahead = SourceCheck::read(
+            Some(now + 3 * 86_400),
+            None,
+            Some(proto::API_LAST_CHECKED),
+            now,
+        );
+        assert_eq!(ahead, SourceCheck::Ahead);
+        assert!(ahead.line().unwrap().contains("not synced"));
+        assert!(ahead.quiet().unwrap().contains("not known"));
+    }
+
+    /// `health --json` carries the timestamp, not the sentence: a script has to be able to
+    /// recompute the age and apply its own threshold, and `update status --json` already
+    /// answers in unix seconds.
+    #[test]
+    fn health_json_carries_the_timestamp_rather_than_the_words() {
+        let mut report = health_report(Some(proto::HealthResult::default()), None);
+        report.software.components[0].last_checked = Some(1_800_000_000);
+        report.software.components[0].source = SourceCheck::Answered(9 * 86_400);
+
+        let json = serde_json::to_value(&report).unwrap();
+        let component = &json["software"]["components"][0];
+        assert_eq!(
+            component["last_checked"],
+            serde_json::json!(1_800_000_000i64)
+        );
+        assert!(component.get("source").is_none(), "{component}");
+    }
+
     // ── version reporting ────────────────────────────────────────────────────
 
     fn report(services: Vec<ServiceReport>, daemon_installed: Option<&str>) -> VersionReport {
@@ -6298,6 +7638,9 @@ mod tests {
                 revision: None,
                 pinned: None,
                 last_attempt: None,
+                last_checked: None,
+                last_check_attempt: None,
+                source: SourceCheck::Unsupported,
             }],
             warnings: Vec::new(),
         }

@@ -35,7 +35,7 @@ export DUCK_TOKEN=github_pat_replace_with_your_token
 ```
 
 ```bash
-./scripts/provision-board.sh radxa@192.168.1.42
+./scripts/provision-board.sh microduck@192.168.1.42
 ```
 
 `--no-dev-key` for a board that should only take releases, `--ref BRANCH` to provision from a
@@ -52,7 +52,7 @@ Three commands, the first from your machine, and what `provision-board.sh` is do
 behalf above:
 
 ```bash
-scp deploy/dev-key/team.dev.pub radxa@192.168.1.42:/tmp/
+scp deploy/dev-key/team.dev.pub microduck@192.168.1.42:/tmp/
 ```
 
 ```bash
@@ -170,6 +170,12 @@ NetworkManager already owns wifi, meaning the cutover took and the run is just t
 backstop. If the backstop fired and restored netplan, re-cutting over unattended would re-arm
 it, fail the same way, reboot, and go round again; it says so in the log and leaves wifi alone.
 The unit file stays on disk, disabled, as a record of what ran.
+
+Re-running after a phase 2 that died is the same command. The state file is still there, so
+`provision.sh` skips phase 1 and the reboot and does phase 2 in the operator's session, printing
+as it goes; it empties the log first, which otherwise still holds the failed attempt.
+`provision-board.sh` learns how the run ended from `/var/lib/robot/provision.outcome`, keyed by
+an id it passes in, and only waits for a reboot when the run actually took one.
 
 The token is needed three times, and only the first two end with provisioning: fetching these
 scripts, fetching the release, and then permanently — `updaterd` reads `GITHUB_TOKEN` from a
@@ -360,6 +366,7 @@ bad time" than a clock.
 /usr/local/bin/robotctl -> current/bin/robotctl
 /usr/local/sbin/robot-provision         provisioning, resumed after its reboot
 /var/lib/robot/provision.log            what the unattended half did
+/var/lib/robot/provision.outcome        how the last launched run ended, for provision-board.sh
 /etc/systemd/system/robot-provision.service   disabled once provisioning finished
 ```
 

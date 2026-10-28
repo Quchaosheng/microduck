@@ -13,6 +13,8 @@ description = "Wifi and robot identity — the config service"
 # It stores no credentials. NetworkManager owns those.
 [dependencies]
 duck-ipc-proto = { path = "../duck-ipc-proto" }
+# The SoC serial, which is read from a different place on each board (`robotd_params::serial`).
+robotd-params = { path = "../robotd-params" }
 serde.workspace = true
 serde_json.workspace = true
 # `process` is for reading the journal: `logs` spawns `journalctl` rather than linking libsystemd
