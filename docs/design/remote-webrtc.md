@@ -539,15 +539,22 @@ the 1920×1080 crop, and every intrinsic would be off by about 1.7×. `mediad::c
 arithmetic and the mode table, including the fact that reading 720p off the sensor would *narrow*
 the view to 27° rather than saving anything.
 
-## 11. Everything on the wire should carry the time it happened — **built**
+## 11. Everything on the wire should carry the time it happened — **built; verified on loopback**
 
-Both halves are built. A sample and a frame each state when the robot saw them, on one clock, and
-the check this section asked for is `scripts/check-frame-dating.py`.
+Both halves are built and measured on loopback. A sample and a frame each state when the robot saw
+them, on one clock, and the check this section asked for is `scripts/check-frame-dating.py`. A run
+on a robot is still outstanding; until then the numbers below are loopback numbers.
 
 **The control channel (v24).** `robot.state` and `tof.frame` carry `t_ns`, and so does
 `head_imu.frame`: `CLOCK_MONOTONIC` in nanoseconds, one clock every daemon on a board shares, so a
 sample from `robotd` and a frame from `tofd` go on one axis without an argument about two start
 times. `robotd-design.md` §Mapping telemetry owns the fields.
+
+**Two images, two versions of `gst-plugins-rs`, and the bug is in both.** The Yocto image the robot
+runs builds it from `08eeb63ff` (0.15.1+) on GStreamer 1.28.2 (`gstreamer1.0-plugins-rs_1.28.2.bb`
+in `microduck_os`); the Debian path (`setup-gstreamer.sh` plus `microduck-gst-plugins`) is 0.15.3 on
+1.26.2. The jitterbuffer behaviour this section works around is present in both, so neither path is
+the one that makes it go away.
 
 **The media half.** A frame is dated twice, and the two are for different jobs.
 
