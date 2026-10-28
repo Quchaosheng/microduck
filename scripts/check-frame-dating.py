@@ -1,40 +1,15 @@
 #!/usr/bin/env python3
-"""Date a frame and a `robot.state` sample from the same stream, and print the difference.
+"""Print, per decoded frame, its capture time beside the newest `robot.state` sample.
 
-`mediad` dates a frame on the robot's own `CLOCK_MONOTONIC` and nothing else: RTCP sender reports
-say so, because `configure_sender_reports` sets `ntp-time-source=clock-time`, and the RFC 6051
-`ntp-64` header extension carries that same clock per frame, added by `wire_payloader_setup`.
-`robot.state` stamps `t_ns` on that clock too, which is the point — a picture and a sample can be
-compared without either side knowing, or agreeing on, what the wall clock says.
+Run it from a laptop against a robot:
 
-    scripts/check-frame-dating.py duck-abc123
+    ssh -NL /tmp/robotd.sock:/run/robotd.sock root@<robot> &
+    scripts/check-frame-dating.py --signaller ws://<robot>:8443 --robot-socket /tmp/robotd.sock
 
-Prints one line per decoded frame — its capture time, the newest `t_ns` beside it, and the
-difference. What to read is that the two columns move together and that the gap stays inside
-the sample period: `robot.subscribe` is asked for 10 Hz below, so 100 ms is the floor on how
-far the sample can trail the frame. A difference around 1.8e18 ns — decades rather than
-milliseconds — means the frame is being dated on the wall clock; no lines at all means the frames
-carry nothing to read.
-
-This is the check `remote-webrtc.md` §11 asks for, and it is `webrtcsrc` rather than something
-hand-rolled because the reference timestamp is only as good as the receiver that reads it: the
-meta comes from `rtpjitterbuffer`, which is inside `webrtcsrc`'s `rtpbin`, and the extension id
-it keys on comes from the SDP the offer carries. A script that built its own jitterbuffer would
-be testing its own copy of that agreement.
-
-Needs `python3-gi` and `gir1.2-gstreamer-1.0`, which a board does not install today — the
-GStreamer packages are there for `mediad`, the typelibs are not. `apt-get install python3-gi
-gir1.2-gstreamer-1.0` fixes that. Nothing else of this repo has to be built, and nothing on the
-robot has to change.
-
-**FEC is turned off for this consumer, and that is not a workaround.** `webrtcsrc` sets
-`fec-type=ULP_RED` on every transceiver it creates, and a sender honours it. With ULPFEC in the
-same stream, H.264 and ULPFEC packets alternate on one SSRC, and `rtpjitterbuffer` clears its
-RTP-to-NTP mapping whenever the payload type changes, so a frame almost never keeps the timestamp
-that arrived with it. Upstream settled the extension handling in `rtpredenc`/`rtpreddec` on `main`
-(so 1.30); the jitterbuffer half was still there in 1.28.6 and the board runs 1.26.2. The
-negotiation is per consumer, so refusing FEC here leaves every other consumer — a browser included
-— exactly as it was. `remote-webrtc.md` §11 has the numbers.
+The two columns should move together with a gap inside the sample period (100 ms at the 10 Hz
+asked for below). About 1.8e18 ns means the frame is dated on the wall clock; no lines at all
+means the frames carry no date. `webrtcsrc` is used rather than a hand-rolled receiver because
+the reference timestamp comes from `rtpjitterbuffer` and the extension id from the SDP.
 """
 
 import argparse
@@ -176,10 +151,11 @@ class Report:
         t_ns = int(sample["t_ns"])
         print(f"{capture:>20}  {t_ns:>20}  {capture - t_ns:>+19d}")
 
-        # The sample is read at the frame, not at the sample, so it is always the older of the
-        # two and the difference is negative by the age of the sample. Left as signed rather
-        # than absolute: a frame dated *after* a sample that came off the same clock is the
-        # interesting direction, and folding it away would hide it.
+        # Left signed rather than absolute. The sample is read when the frame arrives, not when
+        # the sample was taken, so it is usually the older of the two and the difference is
+        # usually negative -- but a frame is decoded some 60 ms after capture, so a sample taken
+        # in that window is the newer one. Either sign is meaningful and folding it away would
+        # hide the direction that matters.
         return Gst.PadProbeReturn.OK
 
 
