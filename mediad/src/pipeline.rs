@@ -1804,38 +1804,18 @@ fn wire_encoder_setup(sink: &gst::Element) -> Result<()> {
     Ok(())
 }
 
-/// Date every frame on the wire, at the moment the sensor produced it.
+/// Add RFC 6051's `ntp-64` extension to every payloader, so each frame carries the time it was
+/// captured instead of a peer interpolating from one sender report a second. `remote-webrtc.md`
+/// §11 has the reasoning and the measurements.
 ///
-/// **What this is for, and why the sender report is not enough on its own.** A receiver gets the
-/// sender's clock from two places: RTCP sender reports — which [`configure_sender_reports`] puts on
-/// `CLOCK_MONOTONIC` at capture time — and RFC 6051's `ntp-64` RTP header extension, which this
-/// function adds to the payloader. The report arrives once a second at best, so a receiver that has
-/// only reports has to interpolate between them and cannot date the frames before the first one;
-/// the extension is written into the packets themselves, so each frame carries its own capture time
-/// from the first packet on. `gst-plugins-rs`'s own `webrtc-precise-sync-send` example is the
-/// arrangement this follows, and `remote-webrtc.md` §11 carries the measurement.
+/// The id matters: `webrtcsink` gives TWCC the smallest unused id *after* this runs, so the
+/// extension registered here keeps its own.
 ///
-/// **The frame is stamped by the driver, so the number is a capture time rather than a send time.**
-/// `rkisp` stamps the buffer with `ktime_get_ns()` at the ISP's frame start and `v4l2src` maps that
-/// into the PTS, so on this pipeline the extension states when the sensor saw the scene — bounded
-/// by the frame-start-versus-exposure-start difference, and not by anything the network does.
+/// Returning `false` leaves the rest of the handler chain in place; `webrtcsink` owns the payload
+/// type, the SSRC and TWCC and still has to get its turn.
 ///
-/// **The extension id is not 1, and that is the whole of the care taken here.** `webrtcsink` gives
-/// TWCC an id of its own after this handler runs, and takes the smallest unused one when it is not
-/// told which — so an extension added here first is the one that keeps its id. A collision would be
-/// silent in both directions: `GstRTPBasePayload` holds one extension per id, so the second one
-/// registered replaces the first, and the wire would carry congestion-control feedback with no
-/// frame dates on it and nothing in the log to say so. Measured on this plugin series, `extmap:1`
-/// (TWCC) and `extmap:4` (this) coexist in the same offer.
-///
-/// **`false` is returned, not `true`.** `true` would declare the payloader fully configured and
-/// stop the rest of the signal's handlers; `webrtcsink` owns the payload type, the SSRC and the
-/// TWCC extension and must still get its turn.
-///
-/// **Nothing here is fatal.** A build without the `rtpmanager` plugin has no `rtphdrextntp64`
-/// factory, and `RTPHeaderExtension::create_from_uri` answers `None` rather than failing — a
-/// session that carries no frame dates is worse than one that does and better than no session, so
-/// every failure here is a warning that names what was lost.
+/// Missing plugins are a warning rather than an error: a session with no frame dates is worse than
+/// one with them and better than no session.
 fn wire_payloader_setup(sink: &gst::Element) -> Result<()> {
     if glib::subclass::signal::SignalId::lookup("payloader-setup", sink.type_()).is_none() {
         return Err(anyhow!(
@@ -2135,9 +2115,10 @@ fn wire_consumers(
 ///   two clocks *and* a clock that has been set, and this board has no battery-backed RTC and
 ///   boots at 1970.
 /// - **`rtcp-sync-send-time=false`** makes the report state the time the frame was *captured*
-///   rather than the time it was *sent*, so the encoding and queueing latency between capture and
-///   the wire is not charged to every frame. That is the difference between a peer dating a frame
-///   to when the camera saw it and dating it to when the socket carried it.
+///   rather than the time it was *sent*. With `=true`, `rtpbin` shifts the report by the
+///   pipeline's *configured* latency — a constant that comes from the caps, not a measurement of
+///   what the encoder and the queue actually took — so every frame would carry that constant
+///   instead of the moment the camera saw it.
 ///
 /// Both are set on the internal `rtpbin`, which is where the reports are built and where
 /// `webrtcbin` itself offers no property for either — the same route upstream's own

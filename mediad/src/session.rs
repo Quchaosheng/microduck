@@ -101,13 +101,15 @@ fn video_params(video: &Video) -> serde_json::Value {
     // extensions in — so a client comparing a picture with a sample does not need this pair at
     // all. It is published for a client that has a reason of its own to name a wall-clock moment,
     // and `real_ns` is that clock.
-    let clock = proto::clock::ClockPair::now();
     let mut params = serde_json::json!({
         "width": video.width,
         "height": video.height,
         "rotate": video.rotate,
-        "mono_ns": clock.mono_ns,
-        "real_ns": clock.real_ns,
+        // The two clocks at one instant: RTCP sender reports state RTP time in wall-clock
+        // (`real_ns`), `robot.state`/`tof.frame` stamp with `mono_ns`'s clock. A peer that has both
+        // can put the picture on the robot's axis.
+        "mono_ns": proto::clock::monotonic_ns(),
+        "real_ns": proto::clock::realtime_ns(),
     });
     // Absent rather than null when the geometry is unknown: a consumer reading a missing key knows
     // it must calibrate, where one reading `null` has to be told what that meant.
